@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -19,8 +20,26 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Session ذخیره‌شده، اگر وجود داشته باشد
-SESSION = os.environ.get("SESSION", "")
+DATA_DIR = "/app/data"
+SESSION_FILE = os.path.join(DATA_DIR, "telegram.session")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_session():
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    return ""
+
+
+def save_session(session_string):
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        f.write(session_string)
+
+
+SESSION = load_session()
 
 client = TelegramClient(
     StringSession(SESSION),
@@ -28,200 +47,62 @@ client = TelegramClient(
     API_HASH,
 )
 
-login_state = {}
-phone_code_hash = {}
 
-
-def is_owner(update: Update):
+def owner_only(update):
     return (
-        update.effective_user
+        update.effective_user is not None
         and update.effective_user.id == OWNER_ID
     )
 
 
+def extract_links(text):
+    pattern = r"https?://t\.me/[A-Za-z0-9_]+(?:\?start=[^\s]+)?"
+    return re.findall(pattern, text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+
+    if not owner_only(update):
         return
 
-    login_state.clear()
-
-    await update.message.reply_text(
-        "سلام 👋\n\n"
-        "برای اتصال اکانت تلگرام:\n"
-        "شماره تلفن را با فرمت بین‌المللی بفرست.\n\n"
-        "مثال:\n"
-        "+1234567890"
-    )
-
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_owner(update):
-        return
-
-    text = (update.message.text or "").strip()
-
-    if not text:
-        return
-
-    try:
-
-        # -------------------------
-        # دریافت شماره
-        # -------------------------
-        if "step" not in login_state:
-
-            phone = text
-
-            if not phone.startswith("+"):
-                await update.message.reply_text(
-                    "❌ شماره باید با + و کد کشور شروع شود.\n"
-                    "مثال: +1234567890"
-                )
-                return
-
-            await client.connect()
-
-            sent = await client.send_code_request(phone)
-
-            login_state["step"] = "code"
-            login_state["phone"] = phone
-
-            phone_code_hash["value"] = sent.phone_code_hash
-
-            await update.message.reply_text(
-                "📩 کد ورود ارسال شد.\n\n"
-                "کد جدیدی که تلگرام همین الان فرستاده را "
-                "وارد کن."
-            )
-
-            return
-
-        # -------------------------
-        # دریافت کد
-        # -------------------------
-        if login_state["step"] == "code":
-
-            code = text.replace(" ", "").replace("-", "")
-
-            phone = login_state["phone"]
-            code_hash = phone_code_hash["value"]
-
-            try:
-
-                await client.sign_in(
-                    phone=phone,
-                    code=code,
-                    phone_code_hash=code_hash,
-                )
-
-                await successful_login(update)
-
-            except Exception as e:
-
-                error = str(e).lower()
-
-                if "password" in error or "two-step" in error:
-
-                    login_state["step"] = "password"
-
-                    await update.message.reply_text(
-                        "🔐 اکانتت رمز دومرحله‌ای دارد.\n\n"
-                        "رمز 2FA را وارد کن."
-                    )
-
-                elif "phone_code_expired" in error:
-
-                    login_state.clear()
-                    phone_code_hash.clear()
-
-                    await update.message.reply_text(
-                        "⌛ کد منقضی شده.\n\n"
-                        "دوباره /start بزن و یک کد جدید بگیر."
-                    )
-
-                elif "phone_code_invalid" in error:
-
-                    await update.message.reply_text(
-                        "❌ این کد اشتباه است.\n\n"
-                        "کد جدیدی که تلگرام همین الان "
-                        "فرستاده را وارد کن."
-                    )
-
-                else:
-
-                    print("LOGIN ERROR:", repr(e))
-
-                    await update.message.reply_text(
-                        "❌ ورود انجام نشد.\n"
-                        "دوباره /start بزن."
-                    )
-
-            return
-
-        # -------------------------
-        # دریافت رمز 2FA
-        # -------------------------
-        if login_state["step"] == "password":
-
-            password = text
-
-            try:
-
-                await client.sign_in(
-                    password=password
-                )
-
-                await successful_login(update)
-
-            except Exception as e:
-
-                print("2FA ERROR:", repr(e))
-
-                await update.message.reply_text(
-                    "❌ رمز دومرحله‌ای صحیح نیست."
-                )
-
-            return
-
-    except Exception as e:
-
-        print("GENERAL ERROR:", repr(e))
+    if await client.is_user_authorized():
 
         await update.message.reply_text(
-            "❌ یک خطا رخ داد.\n"
-            "Logs مربوط به Railway را بررسی کن."
+            "✅ اکانت تلگرام متصل است.\n\n"
+            "حالا می‌توانی لینک‌های t.me را بفرستی."
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ هنوز اکانت تلگرام متصل نشده است.\n\n"
+            "ابتدا Session اکانت را ایجاد و در /app/data/telegram.session "
+            "قرار بده."
         )
 
 
-async def successful_login(update):
+async def handle_links(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    # ساخت Session
-    session_string = client.session.save()
+    if not owner_only(update):
+        return
 
-    # نمایش ندادن Session
-    print("TELEGRAM_ACCOUNT_CONNECTED")
-    print("SESSION_CREATED")
+    text = update.message.text or ""
 
-    login_state.clear()
-    phone_code_hash.clear()
+    links = extract_links(text)
+
+    if not links:
+        await update.message.reply_text(
+            "❌ لینک t.me پیدا نشد."
+        )
+        return
 
     await update.message.reply_text(
-        "✅ اکانت تلگرام با موفقیت متصل شد.\n\n"
-        "حالا مرحله بعدی:\n"
-        "📥 دریافت لینک‌ها\n"
-        "🎯 انتخاب گروه/کانال\n"
-        "📤 ارسال خودکار فایل‌ها"
+        f"📥 {len(links)} لینک دریافت شد.\n\n"
+        "مرحله دریافت و ارسال فایل‌ها بعد از تست اتصال اضافه می‌شود."
     )
-
-    # مهم:
-    # Session باید در Railway به صورت Variable ذخیره شود.
-    # این برنامه آن را در Logs چاپ نمی‌کند.
-    #
-    # فعلاً Session را خودکار در Variable نمی‌نویسیم،
-    # چون Railway Variables از داخل برنامه قابل تغییر نیستند.
 
 
 async def main():
@@ -230,11 +111,14 @@ async def main():
 
     if await client.is_user_authorized():
 
-        print("TELEGRAM_SESSION_ALREADY_AUTHORIZED")
+        print("TELEGRAM_SESSION_OK")
+
+        # اگر Session معتبر است، دوباره ذخیره‌اش می‌کنیم.
+        save_session(client.session.save())
 
     else:
 
-        print("TELEGRAM_ACCOUNT_NOT_AUTHORIZED")
+        print("TELEGRAM_SESSION_NOT_AUTHORIZED")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -245,7 +129,7 @@ async def main():
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_message,
+            handle_links,
         )
     )
 
