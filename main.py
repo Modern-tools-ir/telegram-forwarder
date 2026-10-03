@@ -10,6 +10,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,17 +29,23 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+# Telegram user ID صاحب ربات
 OWNER_ID = 7504234770
 
+# محل Session
 DATA_DIR = "/app/data"
 SESSION_FILE = "/app/data/telegram"
 
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# زمان انتظار برای دریافت جواب ربات مقصد
 WAIT_SECONDS = 55
+
+# بعد از آخرین فایل، کمی صبر
 AFTER_MEDIA_WAIT = 7
 
+# تعداد مقصد در هر صفحه
 PAGE_SIZE = 8
-
-os.makedirs(DATA_DIR, exist_ok=True)
 
 
 # =========================================================
@@ -53,7 +60,7 @@ tg = TelegramClient(
 
 
 # =========================================================
-# STATE
+# GLOBAL STATE
 # =========================================================
 
 destination = None
@@ -71,7 +78,7 @@ destination_cache = {
 
 
 # =========================================================
-# SECURITY
+# OWNER CHECK
 # =========================================================
 
 def is_owner(update: Update):
@@ -101,7 +108,7 @@ def main_menu():
         ],
         [
             InlineKeyboardButton(
-                "📥 پردازش لینک‌ها",
+                "📥 دریافت لینک‌ها",
                 callback_data="links",
             ),
         ],
@@ -166,9 +173,9 @@ async def load_destinations():
 
         entity = dialog.entity
 
-        # -----------------------------------------------
+        # -------------------------------------------------
         # Saved Messages
-        # -----------------------------------------------
+        # -------------------------------------------------
 
         if getattr(entity, "is_self", False):
 
@@ -176,9 +183,9 @@ async def load_destinations():
 
             continue
 
-        # -----------------------------------------------
+        # -------------------------------------------------
         # Channel
-        # -----------------------------------------------
+        # -------------------------------------------------
 
         if getattr(entity, "broadcast", False):
 
@@ -186,9 +193,9 @@ async def load_destinations():
 
             continue
 
-        # -----------------------------------------------
+        # -------------------------------------------------
         # Supergroup
-        # -----------------------------------------------
+        # -------------------------------------------------
 
         if getattr(entity, "megagroup", False):
 
@@ -196,9 +203,9 @@ async def load_destinations():
 
             continue
 
-        # -----------------------------------------------
-        # Normal Group
-        # -----------------------------------------------
+        # -------------------------------------------------
+        # Normal Telegram Group
+        # -------------------------------------------------
 
         if entity.__class__.__name__ == "Chat":
 
@@ -206,26 +213,22 @@ async def load_destinations():
 
             continue
 
-        # -----------------------------------------------
-        # Everything else ignored:
-        # Private chats
-        # Bots
-        # Users
-        # -----------------------------------------------
+        # Users/private chats/bots are ignored.
 
 
 # =========================================================
-# DESTINATION LIST KEYBOARD
+# DESTINATION KEYBOARD
 # =========================================================
 
 def destination_list_keyboard(
-    destination_type,
+    dtype,
     page,
 ):
 
-    items = destination_cache[
-        destination_type
-    ]
+    items = destination_cache.get(
+        dtype,
+        [],
+    )
 
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
@@ -239,7 +242,10 @@ def destination_list_keyboard(
         start=start,
     ):
 
-        title = dialog.name or "بدون نام"
+        title = (
+            dialog.name
+            or "بدون نام"
+        )
 
         if len(title) > 32:
             title = title[:32] + "..."
@@ -248,9 +254,7 @@ def destination_list_keyboard(
             InlineKeyboardButton(
                 f"📁 {title}",
                 callback_data=(
-                    f"select:"
-                    f"{destination_type}:"
-                    f"{index}"
+                    f"select:{dtype}:{index}"
                 ),
             )
         ])
@@ -273,9 +277,7 @@ def destination_list_keyboard(
             InlineKeyboardButton(
                 "◀️ قبلی",
                 callback_data=(
-                    f"page:"
-                    f"{destination_type}:"
-                    f"{page - 1}"
+                    f"page:{dtype}:{page - 1}"
                 ),
             )
         )
@@ -286,15 +288,12 @@ def destination_list_keyboard(
             InlineKeyboardButton(
                 "بعدی ▶️",
                 callback_data=(
-                    f"page:"
-                    f"{destination_type}:"
-                    f"{page + 1}"
+                    f"page:{dtype}:{page + 1}"
                 ),
             )
         )
 
     if navigation:
-
         buttons.append(navigation)
 
     buttons.append([
@@ -311,18 +310,14 @@ def destination_list_keyboard(
 
 
 # =========================================================
-# SHOW DESTINATION TYPES
+# SHOW DESTINATION MENU
 # =========================================================
 
 async def show_destination_types(
     update: Update,
 ):
 
-    if not destination_cache["groups"] and \
-       not destination_cache["channels"] and \
-       not destination_cache["saved"]:
-
-        await load_destinations()
+    await load_destinations()
 
     groups = len(
         destination_cache["groups"]
@@ -346,21 +341,11 @@ async def show_destination_types(
 
     keyboard = destination_type_menu()
 
-    if update.callback_query:
-
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-
-    else:
-
-        await update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
+    await update.callback_query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 # =========================================================
@@ -369,13 +354,14 @@ async def show_destination_types(
 
 async def show_destination_list(
     update: Update,
-    destination_type,
+    dtype,
     page=0,
 ):
 
-    items = destination_cache[
-        destination_type
-    ]
+    items = destination_cache.get(
+        dtype,
+        [],
+    )
 
     names = {
         "groups": "👥 گروه‌ها",
@@ -384,16 +370,11 @@ async def show_destination_list(
     }
 
     title = names.get(
-        destination_type,
+        dtype,
         "مقصدها",
     )
 
     if not items:
-
-        text = (
-            f"{title}\n\n"
-            "❌ موردی پیدا نشد."
-        )
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -404,47 +385,39 @@ async def show_destination_list(
             ]
         ])
 
-    else:
-
-        keyboard, total_pages = (
-            destination_list_keyboard(
-                destination_type,
-                page,
-            )
-        )
-
-        text = (
-            f"{title}\n\n"
-            f"صفحه {page + 1} از "
-            f"{total_pages}\n"
-            f"تعداد: {len(items)}\n\n"
-            "مقصد موردنظر را انتخاب کن:"
-        )
-
-    if update.callback_query:
-
         await update.callback_query.edit_message_text(
-            text,
-            parse_mode="HTML",
+            f"{title}\n\n❌ موردی پیدا نشد.",
             reply_markup=keyboard,
         )
 
-    else:
+        return
 
-        await update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+    keyboard, total_pages = (
+        destination_list_keyboard(
+            dtype,
+            page,
         )
+    )
+
+    text = (
+        f"{title}\n\n"
+        f"📄 صفحه {page + 1} از {total_pages}\n"
+        f"📊 تعداد: {len(items)}\n\n"
+        "مقصد را انتخاب کن:"
+    )
+
+    await update.callback_query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 # =========================================================
 # STATUS
 # =========================================================
 
-async def show_status(
-    update: Update,
-):
+async def show_status(update: Update):
 
     if destination:
 
@@ -461,15 +434,13 @@ async def show_status(
             f"<b>{destination_name}</b>\n"
             f"📂 نوع: "
             f"<b>{destination_type}</b>\n"
-            f"🛑 توقف: "
-            f"{'فعال' if stop_requested else 'خیر'}"
         )
 
     else:
 
         text = (
             "📊 <b>وضعیت</b>\n\n"
-            "🟡 هنوز مقصد انتخاب نشده."
+            "🟡 مقصدی انتخاب نشده."
         )
 
     keyboard = InlineKeyboardMarkup([
@@ -481,7 +452,7 @@ async def show_status(
         ],
         [
             InlineKeyboardButton(
-                "🔙 منوی اصلی",
+                "🏠 منوی اصلی",
                 callback_data="home",
             )
         ],
@@ -498,34 +469,28 @@ async def show_status(
 # HELP
 # =========================================================
 
-async def show_help(
-    update: Update,
-):
+async def show_help(update: Update):
 
     text = (
         "❓ <b>راهنما</b>\n\n"
 
-        "📍 <b>انتخاب مقصد</b>\n"
-        "ابتدا گروه، کانال یا Saved Messages "
-        "را انتخاب کن.\n\n"
+        "1️⃣ ابتدا مقصد را انتخاب کن.\n\n"
 
-        "📥 <b>پردازش لینک‌ها</b>\n"
-        "می‌توانی چند لینک Telegram را "
-        "یکجا ارسال کنی.\n\n"
+        "2️⃣ می‌توانی چند لینک Telegram را "
+        "در یک پیام بفرستی.\n\n"
 
-        "🔄 لینک‌ها یکی‌یکی پردازش می‌شوند.\n\n"
+        "3️⃣ سیستم لینک‌ها را یکی‌یکی پردازش می‌کند.\n\n"
 
-        "📦 فقط پیام‌های دارای Media منتقل "
-        "می‌شوند.\n\n"
+        "4️⃣ فقط پیام‌هایی که Media دارند "
+        "به مقصد ارسال می‌شوند.\n\n"
 
-        "📝 متن تبلیغاتی همراه فایل منتقل "
-        "نمی‌شود.\n\n"
+        "5️⃣ متن تبلیغاتی همراه Media منتقل نمی‌شود.\n\n"
 
-        "🛑 در هر زمان می‌توانی صف را متوقف کنی.\n\n"
+        "6️⃣ نتیجه واقعی ارسال هر فایل در لاگ "
+        "ثبت می‌شود.\n\n"
 
-        "⚠️ اگر یک ربات برای دریافت فایل نیاز "
-        "به دکمه یا مراحل اختصاصی داشته باشد، "
-        "ممکن است نیاز به پردازش اختصاصی داشته باشد."
+        "⚠️ اکانت Telegram که Session آن استفاده "
+        "می‌شود باید خودش در مقصد دسترسی ارسال داشته باشد."
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -548,9 +513,7 @@ async def show_help(
 # HOME
 # =========================================================
 
-async def show_home(
-    update: Update,
-):
+async def show_home(update: Update):
 
     me = await tg.get_me()
 
@@ -607,6 +570,11 @@ async def callback_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    global destination
+    global destination_name
+    global destination_type
+    global stop_requested
+
     if not is_owner(update):
         return
 
@@ -639,7 +607,7 @@ async def callback_handler(
         return
 
     # -----------------------------------------------------
-    # DESTINATION TYPE
+    # TYPE
     # -----------------------------------------------------
 
     if data.startswith("type:"):
@@ -648,10 +616,6 @@ async def callback_handler(
             ":",
             1,
         )[1]
-
-        if dtype not in destination_cache:
-
-            return
 
         await show_destination_list(
             update,
@@ -681,14 +645,10 @@ async def callback_handler(
         return
 
     # -----------------------------------------------------
-    # SELECT DESTINATION
+    # SELECT
     # -----------------------------------------------------
 
     if data.startswith("select:"):
-
-        global destination
-        global destination_name
-        global destination_type
 
         parts = data.split(":")
 
@@ -700,7 +660,7 @@ async def callback_handler(
             [],
         )
 
-        if index >= len(items):
+        if index < 0 or index >= len(items):
 
             await query.edit_message_text(
                 "❌ مقصد پیدا نشد.",
@@ -720,16 +680,65 @@ async def callback_handler(
 
         destination_type = dtype
 
+        # ---------------------------------------------
+        # تست دسترسی مقصد
+        # ---------------------------------------------
+
+        try:
+
+            permissions = (
+                await tg.get_permissions(
+                    destination,
+                    await tg.get_me(),
+                )
+            )
+
+            print(
+                "================================"
+            )
+
+            print(
+                "📍 DESTINATION SELECTED"
+            )
+
+            print(
+                f"Name: {destination_name}"
+            )
+
+            print(
+                f"ID: {destination.id}"
+            )
+
+            print(
+                f"Type: {dtype}"
+            )
+
+            print(
+                f"Send permission: "
+                f"{getattr(permissions, 'send_messages', None)}"
+            )
+
+            print(
+                "================================"
+            )
+
+        except Exception as e:
+
+            print(
+                "Permission check error:",
+                repr(e),
+            )
+
         await query.edit_message_text(
             "✅ <b>مقصد انتخاب شد</b>\n\n"
             f"📍 {destination_name}\n"
             f"📂 {dtype}\n\n"
-            "حالا می‌توانی لینک‌ها را بفرستی.",
+            "حالا لینک‌ها را بفرست.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "📥 پردازش لینک‌ها",
+                        "📥 دریافت لینک‌ها",
                         callback_data="links",
                     )
                 ],
@@ -776,13 +785,7 @@ async def callback_handler(
                             "📍 انتخاب مقصد",
                             callback_data="dest_menu",
                         )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "🔙 بازگشت",
-                            callback_data="home",
-                        )
-                    ],
+                    ]
                 ]),
             )
 
@@ -791,9 +794,8 @@ async def callback_handler(
         await query.edit_message_text(
             "📥 <b>آماده دریافت لینک‌ها</b>\n\n"
             f"📍 مقصد: {destination_name}\n\n"
-            "حالا لینک‌ها را بفرست.\n"
-            "می‌توانی چند لینک را در یک پیام "
-            "یکجا بفرستی.",
+            "حالا یک یا چند لینک Telegram "
+            "را ارسال کن.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -819,13 +821,11 @@ async def callback_handler(
 
     if data == "stop":
 
-        global stop_requested
-
         stop_requested = True
 
         await query.edit_message_text(
             "🛑 <b>درخواست توقف ثبت شد.</b>\n\n"
-            "بعد از پایان لینک فعلی، پردازش متوقف می‌شود.",
+            "بعد از پایان عملیات فعلی متوقف می‌شود.",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
@@ -903,25 +903,124 @@ def parse_link(link):
 
 
 # =========================================================
-# SEND MEDIA ONLY
+# SEND MEDIA
 # =========================================================
 
 async def send_media(message):
 
-    try:
+    if destination is None:
 
-        await tg.send_file(
-            destination,
-            message.media,
-            caption=None,
+        print(
+            "❌ DESTINATION IS NONE"
         )
 
-        return True
+        return {
+            "success": False,
+            "count": 0,
+            "error": "مقصد انتخاب نشده.",
+        }
+
+    try:
+
+        print(
+            "================================"
+        )
+
+        print(
+            "📥 MEDIA RECEIVED"
+        )
+
+        print(
+            f"📍 Destination: "
+            f"{destination_name}"
+        )
+
+        print(
+            f"🆔 Destination ID: "
+            f"{destination.id}"
+        )
+
+        print(
+            f"📦 Source Message ID: "
+            f"{message.id}"
+        )
+
+        print(
+            "📤 SENDING..."
+        )
+
+        # -------------------------------------------------
+        # ارسال فایل بدون متن تبلیغاتی
+        # -------------------------------------------------
+
+        sent = await tg.send_file(
+            entity=destination,
+            file=message.media,
+            caption=None,
+            force_document=False,
+        )
+
+        # -------------------------------------------------
+        # بررسی نتیجه واقعی
+        # -------------------------------------------------
+
+        if sent is None:
+
+            print(
+                "❌ TELEGRAM RETURNED NONE"
+            )
+
+            return {
+                "success": False,
+                "count": 0,
+                "error": (
+                    "Telegram نتیجه ارسال "
+                    "برنگرداند."
+                ),
+            }
+
+        if isinstance(sent, list):
+
+            count = len(sent)
+
+        else:
+
+            count = 1
+
+        if count <= 0:
+
+            print(
+                "❌ ZERO MESSAGES SENT"
+            )
+
+            return {
+                "success": False,
+                "count": 0,
+                "error": (
+                    "هیچ پیامی ارسال نشد."
+                ),
+            }
+
+        print(
+            f"✅ SEND SUCCESS: "
+            f"{count} message(s)"
+        )
+
+        print(
+            "================================"
+        )
+
+        return {
+            "success": True,
+            "count": count,
+            "error": None,
+        }
 
     except FloodWaitError as e:
 
         print(
-            f"FloodWait: {e.seconds}s"
+            f"⏳ FLOOD WAIT: "
+            f"{e.seconds}s"
         )
 
         await asyncio.sleep(
@@ -930,40 +1029,95 @@ async def send_media(message):
 
         try:
 
-            await tg.send_file(
-                destination,
-                message.media,
+            sent = await tg.send_file(
+                entity=destination,
+                file=message.media,
                 caption=None,
+                force_document=False,
             )
 
-            return True
+            if sent is None:
+
+                return {
+                    "success": False,
+                    "count": 0,
+                    "error": (
+                        "Retry نتیجه‌ای نداشت."
+                    ),
+                }
+
+            if isinstance(sent, list):
+                count = len(sent)
+            else:
+                count = 1
+
+            print(
+                f"✅ RETRY SUCCESS: "
+                f"{count}"
+            )
+
+            return {
+                "success": True,
+                "count": count,
+                "error": None,
+            }
 
         except Exception as retry_error:
 
             print(
-                "RETRY SEND ERROR:",
-                repr(retry_error),
+                "❌ RETRY FAILED:"
             )
 
-            return False
+            print(
+                type(retry_error).__name__
+            )
+
+            print(
+                repr(retry_error)
+            )
+
+            return {
+                "success": False,
+                "count": 0,
+                "error": str(
+                    retry_error
+                ),
+            }
 
     except Exception as e:
 
         print(
-            "SEND MEDIA ERROR:",
+            "❌ SEND MEDIA ERROR"
+        )
+
+        print(
+            "Exception:",
+            type(e).__name__,
+        )
+
+        print(
+            "Details:",
             repr(e),
         )
 
-        return False
+        print(
+            "================================"
+        )
+
+        return {
+            "success": False,
+            "count": 0,
+            "error": (
+                f"{type(e).__name__}: {e}"
+            ),
+        }
 
 
 # =========================================================
 # PROCESS ONE LINK
 # =========================================================
 
-async def process_one_link(
-    link,
-):
+async def process_one_link(link):
 
     parsed = parse_link(link)
 
@@ -972,14 +1126,20 @@ async def process_one_link(
         return {
             "success": False,
             "count": 0,
-            "reason": "لینک Telegram معتبر نیست.",
+            "reason": (
+                "لینک Telegram معتبر نیست."
+            ),
         }
 
     username, payload = parsed
 
     print(
-        f"Processing @{username}"
+        f"🔗 Processing: @{username}"
     )
+
+    # -----------------------------------------------------
+    # GET BOT
+    # -----------------------------------------------------
 
     try:
 
@@ -990,20 +1150,18 @@ async def process_one_link(
     except Exception as e:
 
         print(
-            "GET ENTITY ERROR:",
+            "❌ GET ENTITY ERROR:",
             repr(e),
         )
 
         return {
             "success": False,
             "count": 0,
-            "reason": (
-                f"ربات @{username} پیدا نشد."
-            ),
+            "reason": str(e),
         }
 
     # -----------------------------------------------------
-    # START
+    # START BOT
     # -----------------------------------------------------
 
     try:
@@ -1024,27 +1182,25 @@ async def process_one_link(
         )
 
         print(
-            f"Sent: {command}"
+            f"📨 Sent to @{username}: "
+            f"{command}"
         )
 
     except Exception as e:
 
         print(
-            "START ERROR:",
+            "❌ START ERROR:",
             repr(e),
         )
 
         return {
             "success": False,
             "count": 0,
-            "reason": (
-                "ارسال درخواست به ربات "
-                "ناموفق بود."
-            ),
+            "reason": str(e),
         }
 
     # -----------------------------------------------------
-    # WAIT
+    # WAIT FOR MEDIA
     # -----------------------------------------------------
 
     start_time = (
@@ -1083,7 +1239,7 @@ async def process_one_link(
         except Exception as e:
 
             print(
-                "READ ERROR:",
+                "❌ READ ERROR:",
                 repr(e),
             )
 
@@ -1109,33 +1265,57 @@ async def process_one_link(
             if not message.media:
                 continue
 
-            sent = await send_media(
+            print(
+                f"📦 Media found: "
+                f"message {message.id}"
+            )
+
+            result = await send_media(
                 message
             )
 
-            if sent:
+            if result["success"]:
 
-                media_count += 1
+                media_count += (
+                    result["count"]
+                )
 
                 last_media_time = (
                     asyncio.get_running_loop().time()
                 )
 
-        # بعد از دریافت فایل، برای فایل‌های بعدی
-        # کمی صبر می‌کنیم
+            else:
+
+                print(
+                    "❌ FILE NOT SENT:"
+                )
+
+                print(
+                    result["error"]
+                )
+
+        # -------------------------------------------------
+        # اگر فایل دریافت شده و مدتی فایل جدیدی نیامد
+        # -------------------------------------------------
+
         if (
             media_count > 0
-            and last_media_time
+            and last_media_time is not None
             and (
                 asyncio.get_running_loop().time()
                 - last_media_time
             ) >= AFTER_MEDIA_WAIT
         ):
+
             break
 
         await asyncio.sleep(1)
 
-    if media_count:
+    # -----------------------------------------------------
+    # RESULT
+    # -----------------------------------------------------
+
+    if media_count > 0:
 
         return {
             "success": True,
@@ -1147,8 +1327,7 @@ async def process_one_link(
         "success": False,
         "count": 0,
         "reason": (
-            f"در {WAIT_SECONDS} ثانیه "
-            "رسانه‌ای دریافت نشد."
+            "فایلی با موفقیت به مقصد ارسال نشد."
         ),
     }
 
@@ -1179,7 +1358,7 @@ async def process_all(
         status_message = (
             await update.message.reply_text(
                 "🚀 <b>پردازش شروع شد</b>\n\n"
-                f"🔗 تعداد: {total}\n"
+                f"🔗 لینک‌ها: {total}\n"
                 f"📍 مقصد: {destination_name}",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
@@ -1205,8 +1384,9 @@ async def process_all(
 
                 await status_message.edit_text(
                     "⏳ <b>در حال پردازش</b>\n\n"
-                    f"🔗 لینک: {number}/{total}\n"
-                    f"📦 رسانه ارسال‌شده: "
+                    f"🔗 لینک: "
+                    f"{number}/{total}\n"
+                    f"📦 ارسال موفق: "
                     f"{media_total}\n\n"
                     f"<code>{link}</code>",
                     parse_mode="HTML",
@@ -1239,7 +1419,19 @@ async def process_all(
 
                 failed += 1
 
+                print(
+                    "❌ LINK FAILED:"
+                )
+
+                print(
+                    result["reason"]
+                )
+
             await asyncio.sleep(1)
+
+        # -------------------------------------------------
+        # FINAL RESULT
+        # -------------------------------------------------
 
         if stop_requested:
 
@@ -1254,7 +1446,8 @@ async def process_all(
             f"🔗 کل لینک‌ها: {total}\n"
             f"✅ موفق: {success}\n"
             f"❌ ناموفق: {failed}\n"
-            f"📦 رسانه‌ها: {media_total}",
+            f"📦 فایل‌های واقعاً ارسال‌شده: "
+            f"{media_total}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -1296,6 +1489,14 @@ async def text_handler(
     if not is_owner(update):
         return
 
+    if processing:
+
+        await update.message.reply_text(
+            "⏳ پردازش قبلی هنوز در حال اجراست."
+        )
+
+        return
+
     if not destination:
 
         await update.message.reply_text(
@@ -1305,17 +1506,12 @@ async def text_handler(
 
         return
 
-    if processing:
-
-        await update.message.reply_text(
-            "⏳ پردازش قبلی هنوز تمام نشده."
-        )
-
-        return
-
-    links = extract_links(
-        update.message.text or ""
+    text = (
+        update.message.text
+        or ""
     )
+
+    links = extract_links(text)
 
     if not links:
 
@@ -1332,7 +1528,7 @@ async def text_handler(
 
 
 # =========================================================
-# START
+# START COMMAND
 # =========================================================
 
 async def start_command(
@@ -1351,7 +1547,7 @@ async def start_command(
     if not await tg.is_user_authorized():
 
         await update.message.reply_text(
-            "❌ Session معتبر نیست."
+            "❌ Session اکانت Telegram معتبر نیست."
         )
 
         return
@@ -1370,7 +1566,7 @@ async def main():
     )
 
     print(
-        "Connecting Telegram Session..."
+        "🔌 Connecting Telegram..."
     )
 
     await tg.connect()
@@ -1378,7 +1574,7 @@ async def main():
     if not await tg.is_user_authorized():
 
         print(
-            "❌ Session is not authorized."
+            "❌ Telegram Session is NOT authorized."
         )
 
         return
@@ -1386,8 +1582,16 @@ async def main():
     me = await tg.get_me()
 
     print(
-        f"✅ Telegram connected: "
-        f"{me.first_name} ({me.id})"
+        "✅ Telegram Session connected"
+    )
+
+    print(
+        f"👤 Name: "
+        f"{me.first_name or ''}"
+    )
+
+    print(
+        f"🆔 ID: {me.id}"
     )
 
     print(
@@ -1428,7 +1632,7 @@ async def main():
     await app.updater.start_polling()
 
     print(
-        "🤖 Bot started."
+        "🤖 Bot is running."
     )
 
     await asyncio.Event().wait()
@@ -1446,11 +1650,20 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        print("Stopped.")
+        print(
+            "🛑 Stopped."
+        )
 
     except Exception as e:
 
         print(
-            "FATAL ERROR:",
-            repr(e),
+            "🔥 FATAL ERROR:"
+        )
+
+        print(
+            type(e).__name__
+        )
+
+        print(
+            repr(e)
         )
