@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import asyncio
 import tempfile
@@ -40,34 +41,50 @@ from telegram.ext import (
 )
 
 
+def log(msg: str):
+    print(msg, flush=True)
+
+
 # =========================================================
-# CONFIG & PERSISTENCE
+# CONFIG & SAFE ENVIRONMENT LOADING
 # =========================================================
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+raw_api_id = os.environ.get("API_ID", "").strip()
+API_HASH = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.environ.get("OWNER_ID", "7504234770").strip())
 
-# Telegram user ID صاحب ربات
-OWNER_ID = int(os.environ.get("OWNER_ID", 7504234770))
+if not raw_api_id or not API_HASH or not BOT_TOKEN:
+    log("❌ ERROR: Missing environment variables!")
+    log(f"API_ID set: {bool(raw_api_id)} | API_HASH set: {bool(API_HASH)} | BOT_TOKEN set: {bool(BOT_TOKEN)}")
+    log("Please set API_ID, API_HASH, and BOT_TOKEN in Railway -> Variables tab.")
+    sys.exit(1)
 
-# محل Session و تنظیمات دائمی در Railway Volume
+API_ID = int(raw_api_id)
+
+# بررسی مسیر ذخیره‌سازی (با پشتیبانی از حالت بدون Volume)
 DATA_DIR = "/app/data"
-SESSION_FILE = "/app/data/telegram"
-CONFIG_FILE = "/app/data/config.json"
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    test_file = os.path.join(DATA_DIR, ".write_test")
+    with open(test_file, "w") as f:
+        f.write("ok")
+    os.remove(test_file)
+except Exception:
+    DATA_DIR = os.path.abspath("./data")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    log(f"⚠️ Notice: /app/data not writable, using fallback directory: {DATA_DIR}")
 
-os.makedirs(DATA_DIR, exist_ok=True)
+SESSION_FILE = os.path.join(DATA_DIR, "telegram")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 WAIT_SECONDS = 65
 AFTER_MEDIA_WAIT = 8
 PAGE_SIZE = 8
 MAX_BOT_HOPS = 3
 
-tg = TelegramClient(
-    SESSION_FILE,
-    API_ID,
-    API_HASH,
-)
+# کلاینت داخل تابع اصلی (main) مقداردهی می‌شود تا با Event Loop پایتون 3.12+ تداخل نکند
+tg: TelegramClient = None
 
 
 # =========================================================
@@ -79,8 +96,8 @@ default_settings = {
     "destination_name": None,
     "destination_type": None,
     "button_mode": "prompt",      # "prompt" | "auto"
-    "anti_duplicate": True,       # جلوگیری از ارسال فایل تکراری
-    "auto_leave": True,           # خروج خودکار از کانال‌های جوین اجباری
+    "anti_duplicate": True,
+    "auto_leave": True,
     "caption_mode": "none",       # "none" | "clean" | "custom"
     "custom_caption": "",
     "sent_media_ids": [],
@@ -93,7 +110,6 @@ processing = False
 stop_requested = False
 waiting_for_custom_caption = False
 
-# وضعیت لاگین درون‌برنامه‌ای
 login_state = {
     "step": None,          # None | "phone" | "code" | "2fa"
     "phone": None,
@@ -119,7 +135,7 @@ def load_settings():
                 loaded = json.load(f)
                 settings.update(loaded)
         except Exception as e:
-            print("⚠️ Error loading config.json:", repr(e))
+            log(f"⚠️ Error loading config.json: {repr(e)}")
 
 
 def save_settings():
@@ -129,26 +145,26 @@ def save_settings():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print("⚠️ Error saving config.json:", repr(e))
+        log(f"⚠️ Error saving config.json: {repr(e)}")
 
 
 async def restore_destination():
     global destination
-    if not await tg.is_user_authorized():
+    if not tg or not await tg.is_user_authorized():
         return
     dest_id = settings.get("destination_id")
     if not dest_id:
         return
     try:
         destination = await tg.get_entity(dest_id)
-        print(f"✅ Restored destination: {settings.get('destination_name')} ({dest_id})")
+        log(f"✅ Restored destination: {settings.get('destination_name')} ({dest_id})")
     except Exception:
         await load_destinations()
         for dtype in ("groups", "channels", "saved"):
             for dialog in destination_cache[dtype]:
                 if dialog.entity.id == dest_id:
                     destination = dialog.entity
-                    print(f"✅ Restored destination from dialogs: {dialog.name}")
+                    log(f"✅ Restored destination from dialogs: {dialog.name}")
                     return
 
 
@@ -482,10 +498,12 @@ async def handle_login_step(update: Update):
         return
 
     if step == "code":
-        # حذف فاصله‌ها و خط تیره‌ها برای استخراج کد واقعی
         code = re.sub(r"[^0-9]", "", text)
         if not code:
-            await msg.reply_text("❌ کد نامعتبر است. لطفاً کد را با فاصله (مثل <code>1 2 3 4 5</code>) بفرستید:", parse_mode="HTML")
+            await msg.reply_text(
+                "❌ کد نامعتبر است. لطفاً کد را با فاصله (مثل <code>1 2 3 4 5</code>) بفرستید:",
+                parse_mode="HTML",
+            )
             return
 
         try:
@@ -496,7 +514,10 @@ async def handle_login_step(update: Update):
             )
             login_state["step"] = None
             await restore_destination()
-            await msg.reply_text("✅ <b>ورود با موفقیت انجام شد و Session ذخیره گردید!</b>", parse_mode="HTML")
+            await msg.reply_text(
+                "✅ <b>ورود با موفقیت انجام شد و Session ذخیره گردید!</b>",
+                parse_mode="HTML",
+            )
             await show_home(update)
 
         except SessionPasswordNeededError:
@@ -522,7 +543,10 @@ async def handle_login_step(update: Update):
             await tg.sign_in(password=text)
             login_state["step"] = None
             await restore_destination()
-            await msg.reply_text("✅ <b>ورود دو مرحله‌ای با موفقیت انجام شد و Session ذخیره گردید!</b>", parse_mode="HTML")
+            await msg.reply_text(
+                "✅ <b>ورود دو مرحله‌ای با موفقیت انجام شد و Session ذخیره گردید!</b>",
+                parse_mode="HTML",
+            )
             await show_home(update)
         except Exception as e:
             await msg.reply_text(
@@ -533,7 +557,7 @@ async def handle_login_step(update: Update):
 
 
 # =========================================================
-# LINK & BUTTON EXTRACTION FROM USER MESSAGES
+# LINK & BUTTON EXTRACTION
 # =========================================================
 
 def clean_url(url: str) -> str:
@@ -710,7 +734,7 @@ async def send_media_group_or_single(messages_list):
         if not is_real_media(msg):
             continue
         if is_duplicate_media(msg):
-            print(f"🛡 Duplicate media skipped: message {msg.id}")
+            log(f"🛡 Duplicate media skipped: message {msg.id}")
             skipped_dups += 1
             continue
         valid_messages.append(msg)
@@ -750,12 +774,12 @@ async def send_media_group_or_single(messages_list):
             return {"success": True, "count": count, "skipped": skipped_dups, "error": None}
 
     except FloodWaitError as e:
-        print(f"⏳ FloodWait during send: {e.seconds}s")
+        log(f"⏳ FloodWait during send: {e.seconds}s")
         await asyncio.sleep(e.seconds + 1)
         return await send_media_group_or_single(valid_messages)
 
     except Exception as e:
-        print(f"⚠️ Direct send failed ({type(e).__name__}), trying download & re-upload...")
+        log(f"⚠️ Direct send failed ({type(e).__name__}), trying download & re-upload...")
         sent_count = 0
         for idx, m in enumerate(valid_messages):
             tmp_path = None
@@ -773,7 +797,7 @@ async def send_media_group_or_single(messages_list):
                     mark_media_sent(m)
                     sent_count += 1
             except Exception as dl_err:
-                print("❌ Re-upload failed:", repr(dl_err))
+                log(f"❌ Re-upload failed: {repr(dl_err)}")
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
@@ -825,7 +849,7 @@ async def join_sponsor_link(url: str, joined_channels: list) -> bool:
             updates = await tg(ImportChatInviteRequest(parsed["hash"]))
             if hasattr(updates, "chats") and updates.chats:
                 joined_channels.append(updates.chats[0])
-            print(f"✅ Joined private sponsor invite: {parsed['hash']}")
+            log(f"✅ Joined private sponsor invite: {parsed['hash']}")
             await asyncio.sleep(1.5)
             return True
 
@@ -838,17 +862,17 @@ async def join_sponsor_link(url: str, joined_channels: list) -> bool:
                 return False
             await tg(JoinChannelRequest(entity))
             joined_channels.append(entity)
-            print(f"✅ Joined public sponsor channel: @{username}")
+            log(f"✅ Joined public sponsor channel: @{username}")
             await asyncio.sleep(1.5)
             return True
 
     except (UserAlreadyParticipantError, InviteRequestSentError):
         return True
     except FloodWaitError as e:
-        print(f"⏳ FloodWait on JoinChannel: {e.seconds}s")
+        log(f"⏳ FloodWait on JoinChannel: {e.seconds}s")
         await asyncio.sleep(e.seconds + 1)
     except Exception as e:
-        print(f"⚠️ Could not join {url}: {repr(e)}")
+        log(f"⚠️ Could not join {url}: {repr(e)}")
 
     return False
 
@@ -859,10 +883,10 @@ async def cleanup_joined_channels(joined_channels: list):
     for entity in joined_channels:
         try:
             await tg(LeaveChannelRequest(entity))
-            print(f"🚪 Left sponsor channel: {getattr(entity, 'title', entity)}")
+            log(f"🚪 Left sponsor channel: {getattr(entity, 'title', entity)}")
             await asyncio.sleep(1)
         except Exception as e:
-            print("⚠️ Error leaving sponsor channel:", repr(e))
+            log(f"⚠️ Error leaving sponsor channel: {repr(e)}")
 
 
 async def inspect_and_interact_with_bot_message(
@@ -875,7 +899,7 @@ async def inspect_and_interact_with_bot_message(
 
     wait_sec = detect_wait_timer(text)
     if wait_sec > 0:
-        print(f"⏱ Timer detected in bot message! Waiting {wait_sec}s...")
+        log(f"⏱ Timer detected in bot message! Waiting {wait_sec}s...")
         await asyncio.sleep(wait_sec + 1)
 
     next_bot_links = []
@@ -951,12 +975,12 @@ async def inspect_and_interact_with_bot_message(
             r_idx, b_idx, b_title = chosen
             clicked_buttons.add((msg.id, r_idx, b_idx))
             try:
-                print(f"🔘 Clicking inline button [{b_title}] on message {msg.id}...")
+                log(f"🔘 Clicking inline button [{b_title}] on message {msg.id}...")
                 await asyncio.sleep(1.5)
                 await msg.click(r_idx, b_idx)
                 await asyncio.sleep(2)
             except Exception as e:
-                print(f"⚠️ Button click error: {repr(e)}")
+                log(f"⚠️ Button click error: {repr(e)}")
 
         elif joined_any and re_start_url:
             btn_key = (msg.id, "restart_url")
@@ -1051,7 +1075,7 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
     try:
         command = f"/start {payload}" if payload else "/start"
         request = await tg.send_message(bot, command)
-        print(f"📨 [Hop {hop_depth + 1}] Sent to @{username}: {command}")
+        log(f"📨 [Hop {hop_depth + 1}] Sent to @{username}: {command}")
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
@@ -1074,7 +1098,7 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
             try:
                 messages = await tg.get_messages(bot, limit=35, min_id=min_id)
             except Exception as e:
-                print("⚠️ Read messages error:", repr(e))
+                log(f"⚠️ Read messages error: {repr(e)}")
                 await asyncio.sleep(1.5)
                 continue
 
@@ -1133,11 +1157,11 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                     last_activity_time = asyncio.get_running_loop().time()
                 else:
                     skipped_dups += res.get("skipped", 0)
-                    print("❌ Media batch error:", res["error"])
+                    log(f"❌ Media batch error: {res['error']}")
 
             if media_count == 0 and discovered_bot_hops:
                 next_link = discovered_bot_hops.pop(0)
-                print(f"🔀 Hopping to next bot link: {next_link}")
+                log(f"🔀 Hopping to next bot link: {next_link}")
                 hop_res = await process_one_link(
                     next_link,
                     hop_depth=hop_depth + 1,
@@ -1239,7 +1263,7 @@ async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 skipped_total += result.get("skipped", 0)
             else:
                 failed_links += 1
-                print(f"❌ Link failed ({link}): {result['reason']}")
+                log(f"❌ Link failed ({link}): {result['reason']}")
 
             await asyncio.sleep(1)
 
@@ -1453,7 +1477,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update) or not update.message:
         return
 
-    # اگر اکانت هنوز لاگین نیست، پیام‌های متنی را به پروسه لاگین بفرست
     if not await tg.is_user_authorized():
         if login_state.get("step"):
             await handle_login_step(update)
@@ -1543,31 +1566,47 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    log(f"📩 Received /start from user_id: {user_id}")
+
     if not is_owner(update):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
+        await update.message.reply_text(
+            f"⛔ دسترسی ندارید.\nآیدی عددی شما: <code>{user_id}</code>",
+            parse_mode="HTML",
+        )
         return
+
     if not await tg.is_user_authorized():
         await prompt_login(update)
         return
+
     login_state["step"] = None
     await show_home(update)
 
 
 async def main():
-    print("================================")
-    print("🔌 Connecting Telegram...")
+    global tg
+    log("================================")
+    log("🔌 Starting Bot & Connecting Telegram...")
 
     load_settings()
+
+    # ساخت کلاینت داخل لوپ فعال برای جلوگیری از کرش در پایتون 3.12 و 3.13
+    tg = TelegramClient(
+        SESSION_FILE,
+        API_ID,
+        API_HASH,
+    )
     await tg.connect()
 
     if await tg.is_user_authorized():
         me = await tg.get_me()
-        print(f"✅ Telegram Session connected: {me.first_name or ''} ({me.id})")
+        log(f"✅ Telegram Session connected: {me.first_name or ''} ({me.id})")
         await restore_destination()
     else:
-        print("⚠️ Telegram Session is NOT authorized yet. Send /start to the bot in Telegram to log in!")
+        log("⚠️ Telegram Session is NOT authorized yet. Send /start to the bot in Telegram to log in!")
 
-    print("================================")
+    log("================================")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1579,9 +1618,9 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-    print("🤖 Advanced Bot is running.")
+    log("🤖 Advanced Bot is running and polling for messages!")
     await asyncio.Event().wait()
 
 
@@ -1589,6 +1628,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Stopped.")
+        log("🛑 Stopped.")
     except Exception as e:
-        print("🔥 FATAL ERROR:", type(e).__name__, repr(e))
+        log(f"🔥 FATAL ERROR: {type(e).__name__}: {repr(e)}")
