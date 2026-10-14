@@ -19,12 +19,6 @@ from telethon.tl.functions.channels import (
     LeaveChannelRequest,
 )
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import (
-    MessageMediaWebPage,
-    MessageMediaEmpty,
-    KeyboardButtonUrl,
-    KeyboardButtonCallback,
-)
 
 from telegram import (
     Update,
@@ -62,7 +56,6 @@ if not raw_api_id or not API_HASH or not BOT_TOKEN:
 
 API_ID = int(raw_api_id)
 
-# بررسی مسیر ذخیره‌سازی (با پشتیبانی از حالت بدون Volume)
 DATA_DIR = "/app/data"
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -83,7 +76,6 @@ AFTER_MEDIA_WAIT = 8
 PAGE_SIZE = 8
 MAX_BOT_HOPS = 3
 
-# کلاینت داخل تابع اصلی (main) مقداردهی می‌شود تا با Event Loop پایتون 3.12+ تداخل نکند
 tg: TelegramClient = None
 
 
@@ -664,15 +656,17 @@ def parse_tg_link(link: str):
 # =========================================================
 
 def is_real_media(message) -> bool:
-    if not message or not message.media:
+    """تشخیص رسانه واقعی بدون نیاز به ایمپورت کلاس‌های خاص"""
+    if not message or not getattr(message, "media", None):
         return False
-    if isinstance(message.media, (MessageMediaWebPage, MessageMediaEmpty)):
+    media_cls_name = message.media.__class__.__name__
+    if media_cls_name in ("MessageMediaWebPage", "MessageMediaEmpty"):
         return False
     return True
 
 
 def get_media_unique_id(message):
-    if not message or not message.media:
+    if not message or not getattr(message, "media", None):
         return None
     doc = getattr(message.media, "document", None)
     if doc and getattr(doc, "id", None):
@@ -906,11 +900,13 @@ async def inspect_and_interact_with_bot_message(
     joined_any = False
     re_start_url = None
 
-    if msg.reply_markup and hasattr(msg.reply_markup, "rows"):
-        for r_idx, row in enumerate(msg.reply_markup.rows):
-            for b_idx, btn in enumerate(row.buttons):
-                if isinstance(btn, KeyboardButtonUrl) and btn.url:
-                    parsed = parse_tg_link(btn.url)
+    # استفاده از msg.buttons استاندارد خود Telethon (بدون نیاز به ایمپورت کلاس‌های خاص)
+    if getattr(msg, "buttons", None):
+        for r_idx, row in enumerate(msg.buttons):
+            for b_idx, btn in enumerate(row):
+                btn_url = getattr(btn, "url", None)
+                if btn_url:
+                    parsed = parse_tg_link(btn_url)
                     if not parsed:
                         continue
 
@@ -918,7 +914,7 @@ async def inspect_and_interact_with_bot_message(
                         parsed["type"] == "bot_or_entity"
                         and parsed["username"].lower() == current_bot_username.lower()
                     ):
-                        re_start_url = btn.url
+                        re_start_url = btn_url
                         continue
 
                     if parsed["type"] == "bot_or_entity" and (
@@ -927,12 +923,12 @@ async def inspect_and_interact_with_bot_message(
                         try:
                             ent = await tg.get_entity(parsed["username"])
                             if getattr(ent, "bot", False):
-                                next_bot_links.append(btn.url)
+                                next_bot_links.append(btn_url)
                                 continue
                         except Exception:
                             pass
 
-                    did_join = await join_sponsor_link(btn.url, joined_channels)
+                    did_join = await join_sponsor_link(btn_url, joined_channels)
                     if did_join:
                         joined_any = True
 
@@ -951,22 +947,23 @@ async def inspect_and_interact_with_bot_message(
             if did_join:
                 joined_any = True
 
-    if msg.reply_markup and hasattr(msg.reply_markup, "rows"):
+    if getattr(msg, "buttons", None):
         target_callback = None
         fallback_callback = None
 
-        for r_idx, row in enumerate(msg.reply_markup.rows):
-            for b_idx, btn in enumerate(row.buttons):
+        for r_idx, row in enumerate(msg.buttons):
+            for b_idx, btn in enumerate(row):
                 btn_key = (msg.id, r_idx, b_idx)
                 if btn_key in clicked_buttons:
                     continue
 
-                if isinstance(btn, KeyboardButtonCallback):
-                    btn_text = (btn.text or "").lower()
+                # اگر دکمه لینک (URL) ندارد، یعنی دکمه کلیکی (Callback) است
+                if not getattr(btn, "url", None):
+                    btn_text = (getattr(btn, "text", "") or "").lower()
                     if any(kw in btn_text for kw in VERIFY_KEYWORDS):
-                        target_callback = (r_idx, b_idx, btn.text)
+                        target_callback = (r_idx, b_idx, getattr(btn, "text", ""))
                         break
-                    fallback_callback = (r_idx, b_idx, btn.text)
+                    fallback_callback = (r_idx, b_idx, getattr(btn, "text", ""))
             if target_callback:
                 break
 
@@ -1591,7 +1588,6 @@ async def main():
 
     load_settings()
 
-    # ساخت کلاینت داخل لوپ فعال برای جلوگیری از کرش در پایتون 3.12 و 3.13
     tg = TelegramClient(
         SESSION_FILE,
         API_ID,
