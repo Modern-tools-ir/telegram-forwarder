@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import time
 import asyncio
 import tempfile
 
@@ -18,7 +19,10 @@ from telethon.tl.functions.channels import (
     JoinChannelRequest,
     LeaveChannelRequest,
 )
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest,
+    CheckChatInviteRequest,
+)
 
 from telegram import (
     Update,
@@ -49,9 +53,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "7504234770").strip())
 
 if not raw_api_id or not API_HASH or not BOT_TOKEN:
-    log("❌ ERROR: Missing environment variables!")
-    log(f"API_ID set: {bool(raw_api_id)} | API_HASH set: {bool(API_HASH)} | BOT_TOKEN set: {bool(BOT_TOKEN)}")
-    log("Please set API_ID, API_HASH, and BOT_TOKEN in Railway -> Variables tab.")
+    log("❌ ERROR: Missing environment variables (API_ID, API_HASH, BOT_TOKEN)!")
     sys.exit(1)
 
 API_ID = int(raw_api_id)
@@ -66,15 +68,17 @@ try:
 except Exception:
     DATA_DIR = os.path.abspath("./data")
     os.makedirs(DATA_DIR, exist_ok=True)
-    log(f"⚠️ Notice: /app/data not writable, using fallback directory: {DATA_DIR}")
+    log(f"⚠️ Notice: /app/data not writable, using fallback: {DATA_DIR}")
 
 SESSION_FILE = os.path.join(DATA_DIR, "telegram")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-WAIT_SECONDS = 65
-AFTER_MEDIA_WAIT = 8
+# تنظیمات سرعت بالا
+WAIT_SECONDS = 55
+AFTER_MEDIA_WAIT = 3.5
+POLL_INTERVAL = 0.4
 PAGE_SIZE = 8
-MAX_BOT_HOPS = 3
+MAX_BOT_HOPS = 4
 
 tg: TelegramClient = None
 
@@ -93,6 +97,7 @@ default_settings = {
     "caption_mode": "none",       # "none" | "clean" | "custom"
     "custom_caption": "",
     "sent_media_ids": [],
+    "pending_cleanup_ids": [],    # ذخیره آیدی کانال/گروه‌های اسپانسر برای حذف تضمینی
 }
 
 settings = default_settings.copy()
@@ -101,9 +106,10 @@ destination = None
 processing = False
 stop_requested = False
 waiting_for_custom_caption = False
+current_live_step = "آماده به کار"
 
 login_state = {
-    "step": None,          # None | "phone" | "code" | "2fa"
+    "step": None,
     "phone": None,
     "phone_code_hash": None,
 }
@@ -172,21 +178,29 @@ def is_owner(update: Update):
 
 
 # =========================================================
-# MENUS & KEYBOARDS
+# ADVANCED MENUS & KEYBOARDS
 # =========================================================
 
 def main_menu():
+    dest_label = settings.get("destination_name") or "انتخاب نشده"
+    if len(dest_label) > 16:
+        dest_label = dest_label[:16] + "..."
+
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📍 انتخاب مقصد", callback_data="dest_menu"),
-            InlineKeyboardButton("📊 وضعیت و صف", callback_data="status"),
+            InlineKeyboardButton(f"📍 مقصد: {dest_label}", callback_data="dest_menu"),
+            InlineKeyboardButton("📊 وضعیت زنده", callback_data="status"),
         ],
         [
             InlineKeyboardButton("⚙️ تنظیمات هوشمند", callback_data="settings_menu"),
             InlineKeyboardButton("📥 ارسال لینک/پست", callback_data="links"),
         ],
         [
-            InlineKeyboardButton("🧹 ریست تاریخچه تکراری", callback_data="clear_dups"),
+            InlineKeyboardButton("🚪 پاکسازی اسپانسرها", callback_data="force_cleanup"),
+            InlineKeyboardButton("🧹 ریست ضدتکرار", callback_data="clear_dups"),
+        ],
+        [
+            InlineKeyboardButton("🛑 توقف و خالی کردن صف", callback_data="stop"),
             InlineKeyboardButton("❓ راهنما", callback_data="help"),
         ],
     ])
@@ -196,14 +210,14 @@ def settings_menu():
     btn_mode_text = (
         "🤔 پرسش هنگام چند دکمه"
         if settings["button_mode"] == "prompt"
-        else "⚡ دانلود خودکار همه دکمه‌ها"
+        else "⚡ دانلود خودکار همه"
     )
-    dup_text = "✅ فعال" if settings["anti_duplicate"] else "❌ غیرفعال"
-    leave_text = "✅ فعال" if settings["auto_leave"] else "❌ غیرفعال"
+    dup_text = "🟢 فعال" if settings["anti_duplicate"] else "🔴 غیرفعال"
+    leave_text = "🟢 فعال (فوری)" if settings["auto_leave"] else "🔴 غیرفعال"
 
     cap_map = {
         "none": "🚫 بدون کپشن",
-        "clean": "🧹 پاکسازی لینک و تبلیغ",
+        "clean": "🧹 پاکسازی تبلیغات",
         "custom": "✍️ کپشن اختصاصی",
     }
     cap_text = cap_map.get(settings["caption_mode"], "🚫 بدون کپشن")
@@ -211,20 +225,20 @@ def settings_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                f"🎛 حالت دکمه‌ها: {btn_mode_text}",
+                f"🎛 دکمه‌های پست: {btn_mode_text}",
                 callback_data="toggle:button_mode",
             )
         ],
         [
             InlineKeyboardButton(
-                f"🛡 ضد تکرار فایل‌ها: {dup_text}",
-                callback_data="toggle:anti_duplicate",
+                f"🚪 حذف خودکار کانال/گروه اسپانسر: {leave_text}",
+                callback_data="toggle:auto_leave",
             )
         ],
         [
             InlineKeyboardButton(
-                f"🚪 لفت خودکار از اسپانسر: {leave_text}",
-                callback_data="toggle:auto_leave",
+                f"🛡 سیستم ضد تکرار رسانه: {dup_text}",
+                callback_data="toggle:anti_duplicate",
             )
         ],
         [
@@ -235,22 +249,28 @@ def settings_menu():
         ],
         [
             InlineKeyboardButton(
-                "✏️ ویرایش متن کپشن اختصاصی",
+                "✏️ تعیین متن کپشن اختصاصی",
                 callback_data="set_custom_caption",
             )
         ],
         [
-            InlineKeyboardButton("🔙 منوی اصلی", callback_data="home"),
+            InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home"),
         ],
     ])
 
 
 def destination_type_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 گروه‌ها", callback_data="type:groups")],
-        [InlineKeyboardButton("📢 کانال‌ها", callback_data="type:channels")],
-        [InlineKeyboardButton("💾 پیام‌های ذخیره‌شده", callback_data="type:saved")],
-        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="home")],
+        [
+            InlineKeyboardButton("📢 کانال‌ها", callback_data="type:channels"),
+            InlineKeyboardButton("👥 گروه‌ها", callback_data="type:groups"),
+        ],
+        [
+            InlineKeyboardButton("💾 پیام‌های ذخیره‌شده (Saved)", callback_data="type:saved"),
+        ],
+        [
+            InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home"),
+        ],
     ])
 
 
@@ -318,14 +338,16 @@ def destination_list_keyboard(dtype, page):
 async def show_home(update: Update):
     me = await tg.get_me()
     dest_title = settings.get("destination_name") or "انتخاب نشده"
+    state_icon = "⚡ در حال استخراج..." if processing else "🟢 آماده"
 
     text = (
-        "🎛 <b>پنل مدیریت هوشمند</b>\n\n"
-        f"👤 اکانت: {me.first_name or 'بدون نام'} (<code>{me.id}</code>)\n"
-        f"📍 مقصد فعلی: <b>{dest_title}</b>\n"
-        f"📥 لینک‌های در صف: <b>{len(link_queue)}</b>\n"
-        f"🛡 فایل‌های ثبت‌شده در ضدتکرار: <b>{len(settings['sent_media_ids'])}</b>\n\n"
-        "می‌توانی مستقیم لینک بفرستی یا هر پستی (عکس/ویدیو/فایل دارای دکمه) را به اینجا فوروارد کنی:"
+        "🤖 <b>پنل پیشرفته استخراج و فوروارد هوشمند</b>\n\n"
+        f"👤 <b>اکانت متصل:</b> {me.first_name or 'بدون نام'} (<code>{me.id}</code>)\n"
+        f"📍 <b>مقصد فعلی:</b> <b>{dest_title}</b>\n"
+        f"📡 <b>وضعیت:</b> {state_icon} | <b>صف:</b> {len(link_queue)} لینک\n"
+        f"🧭 <b>آخرین مرحله:</b> <i>{current_live_step}</i>\n"
+        f"🛡 <b>آرشیو ضدتکرار:</b> {len(settings['sent_media_ids'])} فایل\n\n"
+        "💡 <i>هر لینک یا پستی (عکس، ویدیو یا فایل دارای دکمه) را مستقیم به اینجا بفرستید:</i>"
     )
 
     if update.callback_query:
@@ -342,11 +364,11 @@ async def show_settings(update: Update):
     custom_cap = settings.get("custom_caption") or "تنظیم نشده"
     text = (
         "⚙️ <b>تنظیمات هوشمند ربات</b>\n\n"
-        "• <b>حالت دکمه‌ها:</b> اگر پستی فوروارد کنید که چند دکمه دانلود داشته باشد، از شما بپرسد یا همه را خودکار دانلود کند.\n"
-        "• <b>ضد تکرار:</b> جلوگیری از ارسال مجدد عکس/ویدیو/فایل‌های تکراری.\n"
-        "• <b>لفت خودکار:</b> خروج از کانال‌های اسپانسر بلافاصله پس از دریافت فایل.\n"
-        f"• <b>کپشن اختصاصی فعلی:</b> <code>{custom_cap}</code>\n\n"
-        "برای تغییر هر مورد روی آن کلیک کنید:"
+        "• <b>دکمه‌های پست:</b> انتخاب کیفیت/دکمه قبل از دانلود یا دانلود خودکار همه.\n"
+        "• <b>حذف خودکار اسپانسر:</b> خروج و پاکسازی فوری تمام کانال‌ها و گروه‌های جوین اجباری به محض دریافت فایل.\n"
+        "• <b>ضد تکرار:</b> جلوگیری از ارسال فایل‌های تکراری.\n"
+        f"• <b>کپشن اختصاصی:</b> <code>{custom_cap}</code>\n\n"
+        "برای تغییر هر گزینه روی دکمه آن بزنید:"
     )
     await update.callback_query.edit_message_text(
         text, parse_mode="HTML", reply_markup=settings_menu()
@@ -360,11 +382,11 @@ async def show_destination_types(update: Update):
     saved = len(destination_cache["saved"])
 
     text = (
-        "📍 <b>انتخاب مقصد</b>\n\n"
-        f"👥 گروه‌ها: {groups}\n"
-        f"📢 کانال‌ها: {channels}\n"
-        f"💾 پیام‌های ذخیره‌شده: {saved}\n\n"
-        "نوع مقصد را انتخاب کن:"
+        "📍 <b>انتخاب مقصد ارسال رسانه‌ها</b>\n\n"
+        f"📢 کانال‌ها: <b>{channels}</b>\n"
+        f"👥 گروه‌ها: <b>{groups}</b>\n"
+        f"💾 پیام‌های ذخیره‌شده: <b>{saved}</b>\n\n"
+        "نوع مقصد مورد نظر را انتخاب کنید:"
     )
     await update.callback_query.edit_message_text(
         text, parse_mode="HTML", reply_markup=destination_type_menu()
@@ -392,9 +414,8 @@ async def show_destination_list(update: Update, dtype, page=0):
     keyboard, total_pages = destination_list_keyboard(dtype, page)
     text = (
         f"{title}\n\n"
-        f"📄 صفحه {page + 1} از {total_pages}\n"
-        f"📊 تعداد: {len(items)}\n\n"
-        "مقصد را انتخاب کن:"
+        f"📄 صفحه {page + 1} از {total_pages} (مجموع: {len(items)})\n\n"
+        "روی مقصد مورد نظر کلیک کنید:"
     )
     await update.callback_query.edit_message_text(
         text, parse_mode="HTML", reply_markup=keyboard
@@ -402,23 +423,25 @@ async def show_destination_list(update: Update, dtype, page=0):
 
 
 async def show_status(update: Update):
-    dest_name = settings.get("destination_name")
-    if dest_name:
-        state = "⏳ در حال پردازش" if processing else "🟢 آماده"
-        text = (
-            "📊 <b>وضعیت سیستم</b>\n\n"
-            f"⚙️ وضعیت: {state}\n"
-            f"📍 مقصد: <b>{dest_name}</b>\n"
-            f"📂 نوع: <b>{settings.get('destination_type')}</b>\n"
-            f"📥 لینک‌های موجود در صف انتظار: <b>{len(link_queue)}</b>\n"
-        )
-    else:
-        text = "📊 <b>وضعیت</b>\n\n🟡 مقصدی انتخاب نشده است."
+    dest_name = settings.get("destination_name") or "انتخاب نشده"
+    state = "⚡ در حال پردازش فعال" if processing else "🟢 آماده به کار"
+    text = (
+        "📊 <b>وضعیت زنده سیستم</b>\n\n"
+        f"⚙️ <b>حالت فعلی:</b> {state}\n"
+        f"🧭 <b>مرحله جاری:</b> <code>{current_live_step}</code>\n"
+        f"📍 <b>مقصد:</b> <b>{dest_name}</b> ({settings.get('destination_type') or '-'})\n"
+        f"📥 <b>لینک‌های در صف:</b> <b>{len(link_queue)}</b>\n"
+        f"🚪 <b>اسپانسرهای در لیست حذف:</b> <b>{len(settings.get('pending_cleanup_ids', []))}</b>\n"
+    )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 توقف و خالی کردن صف", callback_data="stop")],
-        [InlineKeyboardButton("📍 تغییر مقصد", callback_data="dest_menu")],
-        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+        [
+            InlineKeyboardButton("🔄 بروزرسانی وضعیت", callback_data="status"),
+            InlineKeyboardButton("🛑 توقف کامل", callback_data="stop"),
+        ],
+        [
+            InlineKeyboardButton("🏠 منوی اصلی", callback_data="home"),
+        ],
     ])
     await update.callback_query.edit_message_text(
         text, parse_mode="HTML", reply_markup=keyboard
@@ -427,15 +450,14 @@ async def show_status(update: Update):
 
 async def show_help(update: Update):
     text = (
-        "❓ <b>راهنمای قابلیت‌های پیشرفته</b>\n\n"
-        "1️⃣ <b>استخراج خودکار از پست‌ها:</b> کافیست هر پستی (عکس، ویدیو، فایل یا متن) که دارای دکمه شیشه‌ای استارت یا لینک مخفی است را به ربات فوروارد کنید.\n\n"
-        "2️⃣ <b>انتخابگر هوشمند کیفیت‌ها:</b> اگر پست دارای چند دکمه باشد، ربات دکمه‌ها را به شما نمایش می‌دهد تا انتخاب کنید کدام‌یک دانلود شود.\n\n"
-        "3️⃣ <b>گذر خودکار از جوین اجباری و تایمر:</b> ربات خودش در کانال‌های اسپانسر عضو می‌شود، دکمه تایید/ادامه را می‌زند، تایمرها را صبر می‌کند، به ربات‌های بعدی می‌پرد و در پایان از کانال‌های تبلیغاتی لفت می‌دهد.\n\n"
-        "4️⃣ <b>پشتیبانی از همه رسانه‌ها و آلبوم:</b> عکس، ویدیو، فایل، ویس، موزیک و آلبوم‌های چندتایی با فرمت اصلی ارسال می‌شوند.\n\n"
-        "5️⃣ <b>ضد تکرار:</b> از ارسال فایل‌های تکراری به مقصد جلوگیری می‌کند."
+        "❓ <b>راهنمای نسخه فوق سریع و هوشمند</b>\n\n"
+        "⚡ <b>ارسال فوری بدون تاخیر:</b> ربات به محض دیدن عکس، ویدیو یا فایل، در کمتر از نیم ثانیه آن را به مقصد می‌فرستد و گول پیام‌های «تا ۲۰ ثانیه دیگر حذف می‌شود» را نمی‌خورد.\n\n"
+        "🧭 <b>نمایش زنده مراحل:</b> هنگام پردازش هر لینک، دقیقاً روی پیام وضعیت می‌بینید که ربات در حال عضویت، کلیک روی دکمه، پرش به ربات دوم یا ارسال فایل است.\n\n"
+        "🚪 <b>حذف کامل کانال و گروه اسپانسر:</b> بلافاصله پس از گرفتن فایل، تمام کانال‌ها و گروه‌های تبلیغاتی (عمومی و خصوصی) ترک و از لیست چت‌های اکانت شما پاک می‌شوند.\n\n"
+        "🔀 <b>پرش هوشمند بین ربات‌ها:</b> اگر ربات اول شما را با دکمه یا پیام ویرایش‌شده به ربات دوم و سوم بفرستد، ربات خودش به ترتیب وارد همه آن‌ها می‌شود تا فایل اصلی را بگیرد."
     )
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔙 منوی اصلی", callback_data="home")
+        InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home")
     ]])
     await update.callback_query.edit_message_text(
         text, parse_mode="HTML", reply_markup=keyboard
@@ -451,7 +473,7 @@ async def prompt_login(update: Update):
     text = (
         "🔐 <b>ورود به اکانت تلگرام (Session)</b>\n\n"
         "اکانت شما هنوز لاگین نشده است.\n"
-        "لطفاً <b>شماره موبایل</b> اکانت خود را به همراه پیش‌شماره کشور ارسال کنید:\n\n"
+        "لطفاً <b>شماره موبایل</b> اکانت خود را با پیش‌شماره کشور بفرستید:\n\n"
         "مثال: <code>+989123456789</code>"
     )
     if update.callback_query:
@@ -477,14 +499,13 @@ async def handle_login_step(update: Update):
 
             await msg.reply_text(
                 "📩 <b>کد تایید به تلگرام شما ارسال شد!</b>\n\n"
-                "⚠️ <b>بسیار مهم:</b> برای اینکه تلگرام کد را به خاطر ارسال در چت باطل نکند، "
-                "حتماً <b>بین ارقام کد فاصله یا خط تیره بگذارید!</b>\n\n"
-                "مثال: <code>1 2 3 4 5</code> یا <code>1-2-3-4-5</code>",
+                "⚠️ <b>مهم:</b> حتماً <b>بین ارقام کد فاصله بگذارید</b> تا تلگرام کد را باطل نکند!\n\n"
+                "مثال: <code>1 2 3 4 5</code>",
                 parse_mode="HTML",
             )
         except Exception as e:
             await msg.reply_text(
-                f"❌ خطا در ارسال کد:\n<code>{e}</code>\n\nدوباره شماره را با فرمت <code>+98912...</code> بفرستید:",
+                f"❌ خطا در ارسال کد:\n<code>{e}</code>\n\nدوباره شماره را بفرستید:",
                 parse_mode="HTML",
             )
         return
@@ -493,7 +514,7 @@ async def handle_login_step(update: Update):
         code = re.sub(r"[^0-9]", "", text)
         if not code:
             await msg.reply_text(
-                "❌ کد نامعتبر است. لطفاً کد را با فاصله (مثل <code>1 2 3 4 5</code>) بفرستید:",
+                "❌ کد نامعتبر است. کد را با فاصله (مثل <code>1 2 3 4 5</code>) بفرستید:",
                 parse_mode="HTML",
             )
             return
@@ -506,24 +527,19 @@ async def handle_login_step(update: Update):
             )
             login_state["step"] = None
             await restore_destination()
-            await msg.reply_text(
-                "✅ <b>ورود با موفقیت انجام شد و Session ذخیره گردید!</b>",
-                parse_mode="HTML",
-            )
+            await msg.reply_text("✅ <b>ورود با موفقیت انجام شد!</b>", parse_mode="HTML")
             await show_home(update)
 
         except SessionPasswordNeededError:
             login_state["step"] = "2fa"
             await msg.reply_text(
-                "🔑 <b>اکانت شما دارای رمز تایید دو مرحله‌ای (Two-Step Verification) است.</b>\n\n"
-                "لطفاً رمز دو مرحله‌ای خود را ارسال کنید:",
+                "🔑 <b>لطفاً رمز تایید دو مرحله‌ای (Two-Step Verification) خود را بفرستید:</b>",
                 parse_mode="HTML",
             )
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
             login_state["step"] = "phone"
             await msg.reply_text(
-                f"❌ کد وارد شده اشتباه یا منقضی شده است ({type(e).__name__}).\n"
-                "لطفاً دوباره شماره موبایل خود را بفرستید تا کد جدید ارسال شود:",
+                f"❌ کد اشتباه یا منقضی شده ({type(e).__name__}). دوباره شماره موبایل را بفرستید:",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -535,31 +551,46 @@ async def handle_login_step(update: Update):
             await tg.sign_in(password=text)
             login_state["step"] = None
             await restore_destination()
-            await msg.reply_text(
-                "✅ <b>ورود دو مرحله‌ای با موفقیت انجام شد و Session ذخیره گردید!</b>",
-                parse_mode="HTML",
-            )
+            await msg.reply_text("✅ <b>ورود دو مرحله‌ای با موفقیت انجام شد!</b>", parse_mode="HTML")
             await show_home(update)
         except Exception as e:
             await msg.reply_text(
-                f"❌ رمز دو مرحله‌ای اشتباه است یا خطایی رخ داد:\n<code>{e}</code>\n\nدوباره رمز را ارسال کنید:",
+                f"❌ رمز اشتباه است:\n<code>{e}</code>\n\nدوباره رمز را ارسال کنید:",
                 parse_mode="HTML",
             )
         return
 
 
 # =========================================================
-# LINK & BUTTON EXTRACTION
+# LINK & BUTTON EXTRACTION (SUPPORTS tg://resolve & HYPERLINKS)
 # =========================================================
 
-def clean_url(url: str) -> str:
-    return url.strip().rstrip(".,!?،؛)]}>\"'")
+def normalize_tg_url(url: str) -> str:
+    if not url:
+        return ""
+    url = url.strip().rstrip(".,!?،؛)]}>\"'")
+    # تبدیل لینک‌های tg://resolve?domain=X&start=Y به لینک استاندارد https://t.me/
+    if url.lower().startswith("tg://resolve"):
+        m_dom = re.search(r"domain=([A-Za-z0-9_]+)", url, re.IGNORECASE)
+        m_start = re.search(r"(?:start|startgroup)=([^&\s]+)", url, re.IGNORECASE)
+        if m_dom:
+            base = f"https://t.me/{m_dom.group(1)}"
+            if m_start:
+                base += f"?start={m_start.group(1)}"
+            return base
+    if url.lower().startswith("tg://join"):
+        m_inv = re.search(r"invite=([A-Za-z0-9_-]+)", url, re.IGNORECASE)
+        if m_inv:
+            return f"https://t.me/+{m_inv.group(1)}"
+    if not url.startswith("http") and ("t.me/" in url.lower() or "telegram.me/" in url.lower()):
+        url = "https://" + url.lstrip("/")
+    return url
 
 
 def is_valid_tg_link(url: str) -> bool:
     return bool(
         re.search(
-            r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+",
+            r"https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+",
             url,
             re.IGNORECASE,
         )
@@ -570,20 +601,20 @@ def extract_items_from_message(msg) -> list:
     items = []
     seen_urls = set()
 
-    def add_item(title, url):
-        url = clean_url(url)
-        if not url.startswith("http"):
-            url = "https://" + url
+    def add_item(title, raw_url):
+        url = normalize_tg_url(raw_url)
         if is_valid_tg_link(url) and url not in seen_urls:
             seen_urls.add(url)
-            items.append({"title": title or "لینک استخراج‌شده", "url": url})
+            items.append({"title": (title or "لینک").strip(), "url": url})
 
+    # ۱. دکمه‌های شیشه‌ای زیر پست
     if msg.reply_markup and getattr(msg.reply_markup, "inline_keyboard", None):
         for row in msg.reply_markup.inline_keyboard:
             for btn in row:
                 if getattr(btn, "url", None):
                     add_item(btn.text, btn.url)
 
+    # ۲. لینک‌های مخفی داخل متن و کپشن
     text_content = msg.text or msg.caption or ""
     entities = list(msg.entities or []) + list(msg.caption_entities or [])
     for ent in entities:
@@ -591,7 +622,8 @@ def extract_items_from_message(msg) -> list:
             label = text_content[ent.offset : ent.offset + ent.length]
             add_item(label, ent.url)
 
-    pattern = r"https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+"
+    # ۳. لینک‌های آشکار در متن و کپشن
+    pattern = r"(?:https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+|tg://(?:resolve|join)\?[^\s]+)"
     for match in re.finditer(pattern, text_content, re.IGNORECASE):
         add_item("لینک متنی", match.group(0))
 
@@ -602,7 +634,11 @@ def extract_items_from_message(msg) -> list:
 # PARSE TELEGRAM LINKS
 # =========================================================
 
-def parse_tg_link(link: str):
+def parse_tg_link(raw_link: str):
+    link = normalize_tg_url(raw_link)
+    if not link:
+        return None
+
     m_priv = re.search(
         r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)", link, re.IGNORECASE
     )
@@ -611,6 +647,7 @@ def parse_tg_link(link: str):
             "type": "private_post",
             "chat_id": int("-100" + m_priv.group(1)),
             "msg_id": int(m_priv.group(2)),
+            "url": link,
         }
 
     m_inv = re.search(
@@ -622,6 +659,7 @@ def parse_tg_link(link: str):
         return {
             "type": "invite",
             "hash": m_inv.group(1),
+            "url": link,
         }
 
     m_pub = re.search(
@@ -634,6 +672,7 @@ def parse_tg_link(link: str):
             "type": "public_post",
             "username": m_pub.group(1),
             "msg_id": int(m_pub.group(2)),
+            "url": link,
         }
 
     m_bot = re.search(
@@ -646,6 +685,7 @@ def parse_tg_link(link: str):
             "type": "bot_or_entity",
             "username": m_bot.group(1),
             "payload": m_bot.group(2),
+            "url": link,
         }
 
     return None
@@ -656,11 +696,10 @@ def parse_tg_link(link: str):
 # =========================================================
 
 def is_real_media(message) -> bool:
-    """تشخیص رسانه واقعی بدون نیاز به ایمپورت کلاس‌های خاص"""
     if not message or not getattr(message, "media", None):
         return False
     media_cls_name = message.media.__class__.__name__
-    if media_cls_name in ("MessageMediaWebPage", "MessageMediaEmpty"):
+    if media_cls_name in ("MessageMediaWebPage", "MessageMediaEmpty", "MessageMediaUnsupported"):
         return False
     return True
 
@@ -711,10 +750,11 @@ def build_caption(original_text: str):
 
 
 # =========================================================
-# SEND MEDIA & ALBUMS TO DESTINATION
+# ULTRA-FAST MEDIA SENDER (ZERO DELAY)
 # =========================================================
 
 async def send_media_group_or_single(messages_list):
+    """ارسال آنی عکس، ویدیو، فایل، ویس یا آلبوم در کمتر از نیم ثانیه"""
     global destination
     if destination is None:
         await restore_destination()
@@ -728,7 +768,7 @@ async def send_media_group_or_single(messages_list):
         if not is_real_media(msg):
             continue
         if is_duplicate_media(msg):
-            log(f"🛡 Duplicate media skipped: message {msg.id}")
+            log(f"🛡 Duplicate skipped: msg {msg.id}")
             skipped_dups += 1
             continue
         valid_messages.append(msg)
@@ -738,13 +778,14 @@ async def send_media_group_or_single(messages_list):
             "success": skipped_dups > 0,
             "count": 0,
             "skipped": skipped_dups,
-            "error": "همه فایل‌ها تکراری بودند." if skipped_dups > 0 else "مدیای معتبری یافت نشد.",
+            "error": "تکراری" if skipped_dups > 0 else "بدون مدیا",
         }
 
     captions = [build_caption(m.message or "") for m in valid_messages]
     media_files = [m.media for m in valid_messages]
 
     try:
+        # ارسال مستقیم File Reference روی سرور تلگرام (بدون دانلود، در ۰.۲ ثانیه)
         if len(valid_messages) == 1:
             sent = await tg.send_file(
                 entity=destination,
@@ -765,86 +806,144 @@ async def send_media_group_or_single(messages_list):
             for m in valid_messages:
                 mark_media_sent(m)
             count = len(sent) if isinstance(sent, list) else 1
+            log(f"⚡ Instant send success: {count} item(s)")
             return {"success": True, "count": count, "skipped": skipped_dups, "error": None}
 
     except FloodWaitError as e:
         log(f"⏳ FloodWait during send: {e.seconds}s")
-        await asyncio.sleep(e.seconds + 1)
+        await asyncio.sleep(e.seconds + 0.5)
         return await send_media_group_or_single(valid_messages)
 
     except Exception as e:
-        log(f"⚠️ Direct send failed ({type(e).__name__}), trying download & re-upload...")
-        sent_count = 0
-        for idx, m in enumerate(valid_messages):
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, dir="/tmp") as tmp:
-                    tmp_path = tmp.name
-                file_path = await tg.download_media(m, file=tmp_path)
-                if file_path:
-                    await tg.send_file(
-                        entity=destination,
-                        file=file_path,
-                        caption=captions[idx],
-                        force_document=False,
-                    )
-                    mark_media_sent(m)
-                    sent_count += 1
-            except Exception as dl_err:
-                log(f"❌ Re-upload failed: {repr(dl_err)}")
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+        err_str = str(e).lower()
+        log(f"⚠️ Direct send error ({type(e).__name__}): {e}")
 
-        if sent_count > 0:
-            return {"success": True, "count": sent_count, "skipped": skipped_dups, "error": None}
+        # فقط اگر چت قفل فوروارد (Restricted) داشت، دانلود و آپلود کن
+        if "restricted" in err_str or "forward" in err_str:
+            sent_count = 0
+            for idx, m in enumerate(valid_messages):
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, dir="/tmp") as tmp:
+                        tmp_path = tmp.name
+                    file_path = await tg.download_media(m, file=tmp_path)
+                    if file_path:
+                        await tg.send_file(
+                            entity=destination,
+                            file=file_path,
+                            caption=captions[idx],
+                            force_document=False,
+                        )
+                        mark_media_sent(m)
+                        sent_count += 1
+                except Exception as dl_err:
+                    log(f"❌ Restricted fallback failed: {repr(dl_err)}")
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+
+            if sent_count > 0:
+                return {"success": True, "count": sent_count, "skipped": skipped_dups, "error": None}
+
         return {"success": False, "count": 0, "skipped": skipped_dups, "error": str(e)}
 
-    return {"success": False, "count": 0, "skipped": skipped_dups, "error": "ارسال ناموفق بود."}
+    return {"success": False, "count": 0, "skipped": skipped_dups, "error": "خطای نامشخص"}
 
 
 # =========================================================
-# AUTO-JOIN, TIMER & STEP-BUTTON ENGINE
+# COMPLETE SPONSOR JOIN & GUARANTEED LEAVE/DELETE ENGINE
 # =========================================================
 
 VERIFY_KEYWORDS = [
     "تایید", "تأیید", "بررسی", "عضو شدم", "جوین شدم", "دریافت",
     "دانلود", "ادامه", "بعدی", "بخش", "قسمت", "کیفیت", "فایل",
+    "پارت", "مشاهده", "کلیک", "باز کردن", "ورود",
     "check", "verify", "joined", "continue", "download", "get",
-    "start", "try again", "✅", "🔄", "📥", "📂",
+    "start", "try again", "unlock", "✅", "🔄", "📥", "📂", "🎬",
+]
+
+# کلماتی که نشان می‌دهند عددِ داخل متن، هشدارِ حذفِ فایل است نه تایمر انتظار!
+SELF_DESTRUCT_WORDS = [
+    "حذف", "پاک", "ذخیره", "سیو", "فوروارد", "منقضی", "انقضا",
+    "پیام های ذخیره", "سریع", "ثانیه دیگر", "ثانيه ديگر",
+    "delete", "remove", "save", "forward", "expire", "destruct",
 ]
 
 
 def detect_wait_timer(text: str) -> int:
+    """
+    تشخیص هوشمند تایمر انتظار واقعی از هشدار حذف ۲۰ ثانیه‌ای!
+    اگر متن درباره حذف/ذخیره شدن فایل باشد، ۰ برمی‌گرداند تا ربات اصلاً معطل نکند.
+    """
     if not text:
         return 0
-    m = re.search(
-        r"(\d+)\s*(?:ثانیه|ثانيه|second|seconds|sec|s)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        sec = int(m.group(1))
-        if 1 <= sec <= 60:
-            return sec
+    low = text.lower()
+    if any(w in low for w in SELF_DESTRUCT_WORDS):
+        return 0
+
+    if "صبر" in low or "منتظر" in low or "wait" in low:
+        m = re.search(
+            r"(\d+)\s*(?:ثانیه|ثانيه|second|seconds|sec|s)\b",
+            low,
+        )
+        if m:
+            sec = int(m.group(1))
+            if 1 <= sec <= 15:
+                return sec
     return 0
 
 
-async def join_sponsor_link(url: str, joined_channels: list) -> bool:
+def register_sponsor_for_cleanup(entity):
+    """ثبت آیدی کانال/گروه اسپانسر در لیست دائمی برای اطمینان از حذف صددرصدی"""
+    if not entity:
+        return
+    cid = getattr(entity, "id", None)
+    if not cid:
+        return
+    # تبدیل آیدی به فرمت استاندارد تلگرام برای کانال‌ها و سوپرگروه‌ها
+    if getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False):
+        full_id = int(f"-100{cid}") if not str(cid).startswith("-100") else cid
+    elif entity.__class__.__name__ == "Chat":
+        full_id = -abs(cid)
+    else:
+        full_id = cid
+
+    if full_id not in settings["pending_cleanup_ids"]:
+        settings["pending_cleanup_ids"].append(full_id)
+        save_settings()
+
+
+async def join_sponsor_link(url: str, joined_entities: dict, step_cb=None) -> bool:
     parsed = parse_tg_link(url)
     if not parsed:
         return False
 
     try:
         if parsed["type"] == "invite":
-            updates = await tg(ImportChatInviteRequest(parsed["hash"]))
+            inv_hash = parsed["hash"]
+            if step_cb:
+                await step_cb(f"🔗 عضویت در لینک خصوصی اسپانسر...")
+
+            # ابتدا بررسی می‌کنیم آیا قبلاً عضو بوده‌ایم یا مشخصات چت چیست
+            try:
+                chk = await tg(CheckChatInviteRequest(inv_hash))
+                if hasattr(chk, "chat") and chk.chat:
+                    joined_entities[chk.chat.id] = chk.chat
+                    register_sponsor_for_cleanup(chk.chat)
+                    return True
+            except Exception:
+                pass
+
+            updates = await tg(ImportChatInviteRequest(inv_hash))
             if hasattr(updates, "chats") and updates.chats:
-                joined_channels.append(updates.chats[0])
-            log(f"✅ Joined private sponsor invite: {parsed['hash']}")
-            await asyncio.sleep(1.5)
+                for ch in updates.chats:
+                    joined_entities[ch.id] = ch
+                    register_sponsor_for_cleanup(ch)
+            log(f"✅ Joined private sponsor: {inv_hash}")
+            await asyncio.sleep(0.6)
             return True
 
         if parsed["type"] in ("bot_or_entity", "public_post"):
@@ -854,136 +953,243 @@ async def join_sponsor_link(url: str, joined_channels: list) -> bool:
             entity = await tg.get_entity(username)
             if getattr(entity, "bot", False):
                 return False
+
+            if step_cb:
+                await step_cb(f"🔗 عضویت در اسپانسر @{username}...")
+
             await tg(JoinChannelRequest(entity))
-            joined_channels.append(entity)
-            log(f"✅ Joined public sponsor channel: @{username}")
-            await asyncio.sleep(1.5)
+            joined_entities[entity.id] = entity
+            register_sponsor_for_cleanup(entity)
+            log(f"✅ Joined public sponsor: @{username}")
+            await asyncio.sleep(0.6)
             return True
 
-    except (UserAlreadyParticipantError, InviteRequestSentError):
+    except UserAlreadyParticipantError:
+        # حتی اگر از قبل عضو شده بود، در لیست حذف قرار بده تا پاک شود
+        try:
+            if parsed["type"] == "invite":
+                chk = await tg(CheckChatInviteRequest(parsed["hash"]))
+                if hasattr(chk, "chat") and chk.chat:
+                    joined_entities[chk.chat.id] = chk.chat
+                    register_sponsor_for_cleanup(chk.chat)
+            elif parsed.get("username"):
+                ent = await tg.get_entity(parsed["username"])
+                joined_entities[ent.id] = ent
+                register_sponsor_for_cleanup(ent)
+        except Exception:
+            pass
         return True
+
+    except InviteRequestSentError:
+        log(f"📨 Join request sent for private sponsor: {url}")
+        await asyncio.sleep(0.5)
+        return True
+
     except FloodWaitError as e:
-        log(f"⏳ FloodWait on JoinChannel: {e.seconds}s")
-        await asyncio.sleep(e.seconds + 1)
+        log(f"⏳ FloodWait on Join: {e.seconds}s")
+        await asyncio.sleep(e.seconds + 0.5)
+
     except Exception as e:
         log(f"⚠️ Could not join {url}: {repr(e)}")
 
     return False
 
 
-async def cleanup_joined_channels(joined_channels: list):
-    if not settings.get("auto_leave", True) or not joined_channels:
-        return
-    for entity in joined_channels:
-        try:
-            await tg(LeaveChannelRequest(entity))
-            log(f"🚪 Left sponsor channel: {getattr(entity, 'title', entity)}")
-            await asyncio.sleep(1)
-        except Exception as e:
-            log(f"⚠️ Error leaving sponsor channel: {repr(e)}")
+async def cleanup_joined_channels(joined_entities: dict, step_cb=None) -> int:
+    """
+    خروج کامل و حذف گفتگو از تمام کانال‌ها، سوپرگروه‌ها و گروه‌های معمولی اسپانسر
+    """
+    if not settings.get("auto_leave", True):
+        return 0
 
+    # ترکیب موجودیت‌های فعلی و آیدی‌های ذخیره‌شده
+    targets = list(joined_entities.values())
+    seen_raw_ids = {getattr(e, "id", None) for e in targets if getattr(e, "id", None)}
+
+    for saved_id in list(settings.get("pending_cleanup_ids", [])):
+        raw_id = int(str(saved_id).replace("-100", "").lstrip("-"))
+        if raw_id not in seen_raw_ids:
+            targets.append(saved_id)
+
+    if not targets:
+        return 0
+
+    if step_cb:
+        await step_cb(f"🧹 در حال خروج و حذف {len(targets)} کانال/گروه تبلیغاتی...")
+
+    left_count = 0
+    for item in targets:
+        try:
+            # delete_dialog هم از کانال/گروه لفت می‌دهد و هم چت را کامل حذف می‌کند
+            await tg.delete_dialog(item)
+            left_count += 1
+            log(f"🚪 Deleted & left sponsor dialog: {getattr(item, 'title', item)}")
+        except Exception:
+            try:
+                await tg(LeaveChannelRequest(item))
+                left_count += 1
+                log(f"🚪 Left sponsor channel (fallback): {item}")
+            except Exception as e2:
+                log(f"⚠️ Cleanup skip for {item}: {repr(e2)}")
+        await asyncio.sleep(0.3)
+
+    settings["pending_cleanup_ids"] = []
+    save_settings()
+    joined_entities.clear()
+    return left_count
+
+
+# =========================================================
+# SMART BOT INTERACTION & MULTI-HOP REDIRECT DETECTOR
+# =========================================================
 
 async def inspect_and_interact_with_bot_message(
     msg,
     current_bot_username: str,
-    joined_channels: list,
+    current_payload: str,
+    joined_entities: dict,
     clicked_buttons: set,
+    step_cb=None,
 ):
     text = msg.message or ""
 
+    # ۱. بررسی تایمر واقعی (بدون گول خوردن از هشدار ۲۰ ثانیه حذف)
     wait_sec = detect_wait_timer(text)
     if wait_sec > 0:
-        log(f"⏱ Timer detected in bot message! Waiting {wait_sec}s...")
-        await asyncio.sleep(wait_sec + 1)
+        if step_cb:
+            await step_cb(f"⏱ انتظار برای تایمر اجباری ربات ({wait_sec} ثانیه)...")
+        await asyncio.sleep(wait_sec + 0.5)
 
     next_bot_links = []
     joined_any = False
     re_start_url = None
 
-    # استفاده از msg.buttons استاندارد خود Telethon (بدون نیاز به ایمپورت کلاس‌های خاص)
+    # جمع‌آوری تمام لینک‌های داخل دکمه‌های شیشه‌ای و هایپرلینک‌های متن
+    button_urls = []
     if getattr(msg, "buttons", None):
-        for r_idx, row in enumerate(msg.buttons):
-            for b_idx, btn in enumerate(row):
-                btn_url = getattr(btn, "url", None)
-                if btn_url:
-                    parsed = parse_tg_link(btn_url)
-                    if not parsed:
-                        continue
+        for row in msg.buttons:
+            for btn in row:
+                b_url = getattr(btn, "url", None)
+                if b_url:
+                    button_urls.append((getattr(btn, "text", "") or "", normalize_tg_url(b_url)))
 
-                    if (
-                        parsed["type"] == "bot_or_entity"
-                        and parsed["username"].lower() == current_bot_username.lower()
-                    ):
-                        re_start_url = btn_url
-                        continue
+    # بررسی هایپرلینک‌های داخل متن پیام ربات
+    for ent in getattr(msg, "entities", None) or []:
+        ent_url = getattr(ent, "url", None)
+        if ent_url:
+            button_urls.append(("لینک متن", normalize_tg_url(ent_url)))
 
-                    if parsed["type"] == "bot_or_entity" and (
-                        parsed["payload"] or parsed["username"].lower().endswith("bot")
-                    ):
-                        try:
-                            ent = await tg.get_entity(parsed["username"])
-                            if getattr(ent, "bot", False):
-                                next_bot_links.append(btn_url)
-                                continue
-                        except Exception:
-                            pass
-
-                    did_join = await join_sponsor_link(btn_url, joined_channels)
-                    if did_join:
-                        joined_any = True
-
+    # بررسی لینک‌های آشکار داخل متن پیام ربات
     for match in re.finditer(
-        r"https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+", text, re.IGNORECASE
+        r"(?:https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+|tg://(?:resolve|join)\?[^\s]+)",
+        text,
+        re.IGNORECASE,
     ):
-        url = clean_url(match.group(0))
-        parsed = parse_tg_link(url)
-        if parsed and parsed["type"] in ("invite", "bot_or_entity"):
-            if (
-                parsed["type"] == "bot_or_entity"
-                and parsed["username"].lower() == current_bot_username.lower()
-            ):
-                continue
-            did_join = await join_sponsor_link(url, joined_channels)
-            if did_join:
-                joined_any = True
+        u = normalize_tg_url(match.group(0))
+        if all(u != existing_url for _, existing_url in button_urls):
+            button_urls.append(("لینک متنی", u))
 
+    # ۲. تفکیک لینک‌های اسپانسر از لینک‌های پرش به ربات بعدی
+    for btn_label, b_url in button_urls:
+        parsed = parse_tg_link(b_url)
+        if not parsed:
+            continue
+
+        # الف) اگر لینک دعوت خصوصی است -> قطعاً کانال/گروه اسپانسر است
+        if parsed["type"] == "invite":
+            if await join_sponsor_link(b_url, joined_entities, step_cb):
+                joined_any = True
+            continue
+
+        # ب) اگر لینک به خودِ همین ربات است
+        if (
+            parsed["type"] == "bot_or_entity"
+            and parsed["username"].lower() == current_bot_username.lower()
+        ):
+            # اگر پارامتر استارت جدیدی دارد، هم می‌تواند دکمه تایید باشد و هم مرحله بعد
+            re_start_url = b_url
+            if parsed.get("payload") and parsed["payload"] != current_payload:
+                if b_url not in next_bot_links:
+                    next_bot_links.append(b_url)
+            continue
+
+        # ج) اگر لینک دارای ?start= به ربات دیگری است -> پرش به ربات دوم!
+        if parsed["type"] == "bot_or_entity" and parsed.get("payload"):
+            if b_url not in next_bot_links:
+                next_bot_links.append(b_url)
+            continue
+
+        # د) اگر یوزرنیم بدون پارامتر است، چک کن ربات است یا کانال/گروه اسپانسر
+        if parsed["type"] == "bot_or_entity":
+            uname = parsed["username"]
+            try:
+                ent = await tg.get_entity(uname)
+                if getattr(ent, "bot", False):
+                    # اگر ربات دیگری است ولی در دکمه کلمات دانلود/دریافت دارد، به عنوان ربات بعدی ثبت کن
+                    if any(k in btn_label.lower() for k in VERIFY_KEYWORDS):
+                        if b_url not in next_bot_links:
+                            next_bot_links.append(b_url)
+                else:
+                    # کانال یا گروه اسپانسر است
+                    if await join_sponsor_link(b_url, joined_entities, step_cb):
+                        joined_any = True
+            except Exception:
+                pass
+
+    # ۳. کلیک هوشمند روی دکمه تایید عضویت یا دکمه‌های مرحله‌ای (Callback)
     if getattr(msg, "buttons", None):
         target_callback = None
         fallback_callback = None
 
+        # امضای پیام با احتساب تاریخ ویرایش (تا اگر پیام بعد از کلیک ویرایش شد، دکمه‌های جدیدش هم کلیک شوند!)
+        edit_stamp = str(getattr(msg, "edit_date", "") or "")
+
         for r_idx, row in enumerate(msg.buttons):
             for b_idx, btn in enumerate(row):
-                btn_key = (msg.id, r_idx, b_idx)
+                if getattr(btn, "url", None):
+                    continue
+
+                btn_title = (getattr(btn, "text", "") or "").strip()
+                btn_key = (msg.id, edit_stamp, r_idx, b_idx, btn_title)
                 if btn_key in clicked_buttons:
                     continue
 
-                # اگر دکمه لینک (URL) ندارد، یعنی دکمه کلیکی (Callback) است
-                if not getattr(btn, "url", None):
-                    btn_text = (getattr(btn, "text", "") or "").lower()
-                    if any(kw in btn_text for kw in VERIFY_KEYWORDS):
-                        target_callback = (r_idx, b_idx, getattr(btn, "text", ""))
-                        break
-                    fallback_callback = (r_idx, b_idx, getattr(btn, "text", ""))
+                btn_low = btn_title.lower()
+                if any(kw in btn_low for kw in VERIFY_KEYWORDS):
+                    target_callback = (r_idx, b_idx, btn_title, btn_key)
+                    break
+                fallback_callback = (r_idx, b_idx, btn_title, btn_key)
             if target_callback:
                 break
 
         chosen = target_callback or (fallback_callback if joined_any else None)
         if chosen:
-            r_idx, b_idx, b_title = chosen
-            clicked_buttons.add((msg.id, r_idx, b_idx))
+            r_idx, b_idx, b_title, btn_key = chosen
+            clicked_buttons.add(btn_key)
             try:
-                log(f"🔘 Clicking inline button [{b_title}] on message {msg.id}...")
-                await asyncio.sleep(1.5)
-                await msg.click(r_idx, b_idx)
-                await asyncio.sleep(2)
+                if step_cb:
+                    await step_cb(f"🔘 کلیک خودکار روی دکمه «{b_title}»...")
+                log(f"🔘 Clicking button [{b_title}] on msg {msg.id}...")
+                click_res = await msg.click(r_idx, b_idx)
+
+                # اگر دکمه کلیکی در پاسخ یک URL مخفی برگرداند (Callback URL Redirect)
+                res_url = getattr(click_res, "url", None)
+                if res_url:
+                    norm_res_url = normalize_tg_url(res_url)
+                    if norm_res_url and norm_res_url not in next_bot_links:
+                        log(f"🔀 Callback returned redirect URL: {norm_res_url}")
+                        next_bot_links.insert(0, norm_res_url)
+
+                await asyncio.sleep(0.8)
             except Exception as e:
                 log(f"⚠️ Button click error: {repr(e)}")
 
         elif joined_any and re_start_url:
-            btn_key = (msg.id, "restart_url")
+            btn_key = (msg.id, "restart_url", re_start_url)
             if btn_key not in clicked_buttons:
                 clicked_buttons.add(btn_key)
-                next_bot_links.insert(0, re_start_url)
+                if re_start_url not in next_bot_links:
+                    next_bot_links.insert(0, re_start_url)
 
     return next_bot_links
 
@@ -992,8 +1198,11 @@ async def inspect_and_interact_with_bot_message(
 # PROCESS DIRECT CHANNEL POSTS & BOT LINKS
 # =========================================================
 
-async def process_channel_post(parsed_info):
+async def process_channel_post(parsed_info, step_cb=None):
     try:
+        if step_cb:
+            await step_cb("📥 در حال دریافت مستقیم پست از کانال...")
+
         target = (
             parsed_info["chat_id"]
             if parsed_info["type"] == "private_post"
@@ -1015,8 +1224,12 @@ async def process_channel_post(parsed_info):
                 m for m in surrounding
                 if m and getattr(m, "grouped_id", None) == msg.grouped_id
             ]
+            if step_cb:
+                await step_cb(f"⚡ ارسال فوری آلبوم ({len(album)} رسانه) به مقصد...")
             res = await send_media_group_or_single(album)
         else:
+            if step_cb:
+                await step_cb("⚡ ارسال فوری رسانه به مقصد...")
             res = await send_media_group_or_single([msg])
 
         return {
@@ -1029,9 +1242,22 @@ async def process_channel_post(parsed_info):
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
 
-async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
-    if joined_channels is None:
-        joined_channels = []
+async def process_one_link(
+    link: str,
+    hop_depth: int = 0,
+    joined_entities: dict = None,
+    visited_links: set = None,
+    step_cb=None,
+):
+    if joined_entities is None:
+        joined_entities = {}
+    if visited_links is None:
+        visited_links = set()
+
+    norm_link = normalize_tg_url(link)
+    if norm_link in visited_links:
+        return {"success": False, "count": 0, "skipped": 0, "reason": "لینک تکراری در چرخه"}
+    visited_links.add(norm_link)
 
     if hop_depth >= MAX_BOT_HOPS:
         return {
@@ -1041,7 +1267,7 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
             "reason": "تعداد پرش بین ربات‌ها از حد مجاز گذشت.",
         }
 
-    parsed = parse_tg_link(link)
+    parsed = parse_tg_link(norm_link)
     if not parsed:
         return {
             "success": False,
@@ -1051,7 +1277,7 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
         }
 
     if parsed["type"] in ("private_post", "public_post"):
-        return await process_channel_post(parsed)
+        return await process_channel_post(parsed, step_cb=step_cb)
 
     if parsed["type"] != "bot_or_entity":
         return {
@@ -1062,23 +1288,37 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
         }
 
     username = parsed["username"]
-    payload = parsed["payload"]
+    payload = parsed.get("payload")
 
     try:
+        if step_cb:
+            await step_cb(f"📡 اتصال به @{username} (مرحله {hop_depth + 1})...")
         bot = await tg.get_entity(username)
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
+    # اگر لینک به یک کانال عمومی یا گروه اشاره داشت (نه ربات)
+    if not getattr(bot, "bot", False):
+        return {
+            "success": False,
+            "count": 0,
+            "skipped": 0,
+            "reason": f"@{username} یک ربات نیست.",
+        }
+
     try:
         command = f"/start {payload}" if payload else "/start"
+        if step_cb:
+            await step_cb(f"📨 ارسال دستور شروع به @{username}...")
         request = await tg.send_message(bot, command)
         log(f"📨 [Hop {hop_depth + 1}] Sent to @{username}: {command}")
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
     start_time = asyncio.get_running_loop().time()
-    min_id = request.id
+    min_id = max(0, request.id - 1)
     processed_media_msg_ids = set()
+    inspected_text_signatures = set()
     clicked_buttons = set()
     discovered_bot_hops = []
 
@@ -1093,25 +1333,26 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                 break
 
             try:
-                messages = await tg.get_messages(bot, limit=35, min_id=min_id)
+                messages = await tg.get_messages(bot, limit=30, min_id=min_id)
             except Exception as e:
-                log(f"⚠️ Read messages error: {repr(e)}")
-                await asyncio.sleep(1.5)
+                log(f"⚠️ Read error: {repr(e)}")
+                await asyncio.sleep(0.5)
                 continue
 
-            messages = list(reversed(messages))
+            messages = [
+                m for m in reversed(messages)
+                if m and m.id > request.id and not m.out
+            ]
 
+            # =====================================================
+            # اولویت ۱: شکار و ارسال فوق سریع رسانه‌ها (قبل از هر کاری!)
+            # =====================================================
             media_batches = []
             current_group_id = None
             current_group_list = []
 
             for message in messages:
-                if message.id <= request.id or message.out:
-                    continue
-
-                if is_real_media(message):
-                    if message.id in processed_media_msg_ids:
-                        continue
+                if is_real_media(message) and message.id not in processed_media_msg_ids:
                     processed_media_msg_ids.add(message.id)
                     last_activity_time = asyncio.get_running_loop().time()
 
@@ -1130,23 +1371,16 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                             current_group_list = []
                             current_group_id = None
                         media_batches.append([message])
-                else:
-                    hops = await inspect_and_interact_with_bot_message(
-                        message,
-                        username,
-                        joined_channels,
-                        clicked_buttons,
-                    )
-                    for h in hops:
-                        if h not in discovered_bot_hops:
-                            discovered_bot_hops.append(h)
-                            last_activity_time = asyncio.get_running_loop().time()
 
             if current_group_list:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.6)
                 media_batches.append(current_group_list)
 
             for batch in media_batches:
+                if step_cb:
+                    await step_cb(
+                        f"⚡ دریافت رسانه از @{username}! در حال ارسال فوری به مقصد..."
+                    )
                 res = await send_media_group_or_single(batch)
                 if res["success"]:
                     media_count += res["count"]
@@ -1156,19 +1390,61 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                     skipped_dups += res.get("skipped", 0)
                     log(f"❌ Media batch error: {res['error']}")
 
+            # =====================================================
+            # اولویت ۲: بررسی پیام‌های متنی، دکمه‌ها و پیام‌های ویرایش‌شده
+            # =====================================================
+            for message in messages:
+                # حتی اگر پیام مدیا دارد ولی زیرش دکمه مرحله بعد یا لینک ربات دوم است، دکمه‌هایش را هم بررسی کن
+                btn_count = sum(len(r) for r in (getattr(message, "buttons", None) or []))
+                sig = (
+                    message.id,
+                    str(getattr(message, "edit_date", "") or ""),
+                    btn_count,
+                    len(message.message or ""),
+                )
+                if sig in inspected_text_signatures:
+                    continue
+
+                if not is_real_media(message) or btn_count > 0:
+                    inspected_text_signatures.add(sig)
+                    hops = await inspect_and_interact_with_bot_message(
+                        message,
+                        username,
+                        payload,
+                        joined_entities,
+                        clicked_buttons,
+                        step_cb=step_cb,
+                    )
+                    for h in hops:
+                        if h not in discovered_bot_hops and normalize_tg_url(h) not in visited_links:
+                            discovered_bot_hops.append(h)
+                            last_activity_time = asyncio.get_running_loop().time()
+
+            # =====================================================
+            # اولویت ۳: پرش هوشمند به ربات دوم/سوم در صورت وجود لینک هدایت
+            # =====================================================
             if media_count == 0 and discovered_bot_hops:
                 next_link = discovered_bot_hops.pop(0)
+                parsed_next = parse_tg_link(next_link)
+                next_name = parsed_next.get("username", "ربات بعدی") if parsed_next else "ربات بعدی"
+
+                if step_cb:
+                    await step_cb(f"🔀 پرش هوشمند به @{next_name} برای دریافت فایل...")
                 log(f"🔀 Hopping to next bot link: {next_link}")
+
                 hop_res = await process_one_link(
                     next_link,
                     hop_depth=hop_depth + 1,
-                    joined_channels=joined_channels,
+                    joined_entities=joined_entities,
+                    visited_links=visited_links,
+                    step_cb=step_cb,
                 )
                 media_count += hop_res["count"]
                 skipped_dups += hop_res.get("skipped", 0)
                 if hop_res["success"]:
                     break
 
+            # خروج سریع به محض اینکه همه فایل‌های ربات دریافت و ارسال شدند
             if (
                 (media_count > 0 or skipped_dups > 0)
                 and (asyncio.get_running_loop().time() - last_activity_time)
@@ -1176,11 +1452,12 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
             ):
                 break
 
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(POLL_INTERVAL)
 
     finally:
-        if hop_depth == 0 and joined_channels:
-            await cleanup_joined_channels(joined_channels)
+        # به محض تمام شدن کار لینک در سطح اول، فوری از تمام کانال‌ها و گروه‌های اسپانسر خارج شو و پاکشان کن
+        if hop_depth == 0:
+            await cleanup_joined_channels(joined_entities, step_cb=step_cb)
 
     if media_count > 0 or skipped_dups > 0:
         return {
@@ -1199,11 +1476,11 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
 
 
 # =========================================================
-# QUEUE RUNNER
+# LIVE QUEUE RUNNER WITH REAL-TIME TELEGRAM STATUS
 # =========================================================
 
 async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    global processing, stop_requested
+    global processing, stop_requested, current_live_step
     if processing:
         return
 
@@ -1219,15 +1496,17 @@ async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     status_message = await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "🚀 <b>پردازش صف هوشمند آغاز شد</b>\n\n"
-            f"📥 لینک‌های در صف: {len(link_queue)}\n"
+            "🚀 <b>موتور هوشمند استخراج آغاز به کار کرد</b>\n\n"
+            f"📥 لینک‌های در صف: <b>{len(link_queue)}</b>\n"
             f"📍 مقصد: <b>{settings.get('destination_name')}</b>"
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🛑 توقف کامل", callback_data="stop")
+            InlineKeyboardButton("🛑 توقف فوری", callback_data="stop")
         ]]),
     )
+
+    last_edit_time = 0.0
 
     try:
         while link_queue and not stop_requested:
@@ -1236,51 +1515,65 @@ async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             link = item["url"]
             title = item.get("title") or "لینک"
 
-            try:
-                await status_message.edit_text(
-                    "⏳ <b>در حال پردازش هوشمند...</b>\n\n"
-                    f"🏷 عنوان: <b>{title}</b>\n"
-                    f"🔗 انجام‌شده: {total_processed} (باقی‌مانده در صف: {len(link_queue)})\n"
-                    f"📦 فایل‌های ارسال‌شده: <b>{media_total}</b>\n"
-                    f"🛡 تکراریِ ردشده: <b>{skipped_total}</b>\n\n"
-                    f"<code>{link}</code>",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🛑 توقف کامل", callback_data="stop")
-                    ]]),
-                )
-            except Exception:
-                pass
+            async def update_live_step(step_text: str, force: bool = False):
+                global current_live_step
+                nonlocal last_edit_time
+                current_live_step = step_text
+                now = time.monotonic()
+                if not force and (now - last_edit_time) < 0.85:
+                    return
+                last_edit_time = now
+                try:
+                    await status_message.edit_text(
+                        "⚡ <b>در حال استخراج و ارسال هوشمند...</b>\n\n"
+                        f"🏷 <b>عنوان:</b> {title}\n"
+                        f"🧭 <b>مرحله فعلی:</b> <b>{step_text}</b>\n\n"
+                        f"📊 <b>پیشرفت:</b> لینک {total_processed} (صف انتظار: {len(link_queue)})\n"
+                        f"📦 <b>ارسال‌شده به مقصد:</b> <b>{media_total}</b> رسانه\n"
+                        f"🛡 <b>تکراریِ ردشده:</b> {skipped_total}\n\n"
+                        f"🔗 <code>{link}</code>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🛑 توقف فوری", callback_data="stop")
+                        ]]),
+                    )
+                except Exception:
+                    pass
 
-            result = await process_one_link(link)
+            await update_live_step("🔍 شروع آنالیز لینک...", force=True)
+            result = await process_one_link(link, step_cb=update_live_step)
 
             if result["success"]:
                 success_links += 1
                 media_total += result["count"]
                 skipped_total += result.get("skipped", 0)
+                await update_live_step("✅ رسانه با موفقیت به مقصد ارسال شد!", force=True)
             else:
                 failed_links += 1
                 log(f"❌ Link failed ({link}): {result['reason']}")
+                await update_live_step(f"❌ ناموفق: {result['reason']}", force=True)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.4)
 
-        header = "🛑 پردازش متوقف شد" if stop_requested else "🏁 پردازش صف کامل شد"
+        current_live_step = "آماده به کار"
+        header = "🛑 عملیات متوقف شد" if stop_requested else "🏁 عملیات با موفقیت کامل شد"
         if stop_requested:
             link_queue.clear()
 
         await status_message.edit_text(
             f"<b>{header}</b>\n\n"
-            f"🔗 کل لینک‌های بررسی‌شده: {total_processed}\n"
-            f"✅ لینک‌های موفق: {success_links}\n"
-            f"❌ لینک‌های ناموفق: {failed_links}\n"
-            f"📦 فایل‌های ارسال‌شده به مقصد: <b>{media_total}</b>\n"
-            f"🛡 فایل‌های تکراری ردشده: <b>{skipped_total}</b>",
+            f"🔗 <b>کل لینک‌های پردازش‌شده:</b> {total_processed}\n"
+            f"✅ <b>موفق:</b> {success_links} | ❌ <b>ناموفق:</b> {failed_links}\n"
+            f"📦 <b>مجموع رسانه‌های ارسال‌شده:</b> <b>{media_total}</b>\n"
+            f"🛡 <b>فایل‌های تکراری ردشده:</b> {skipped_total}\n"
+            f"🚪 <b>وضعیت اسپانسرها:</b> پاکسازی کامل انجام شد",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
     finally:
         processing = False
         stop_requested = False
+        current_live_step = "آماده به کار"
 
 
 # =========================================================
@@ -1335,7 +1628,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_for_custom_caption = True
         await query.edit_message_text(
             "✍️ <b>تنظیم کپشن اختصاصی</b>\n\n"
-            "لطفاً متن یا آیدی دلخواه خود را ارسال کنید تا زیر تمام فایل‌های ارسالی قرار بگیرد:",
+            "متن یا آیدی کانال خود را بفرستید تا زیر تمام فایل‌های ارسالی قرار بگیرد:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 انصراف", callback_data="settings_menu")
@@ -1343,11 +1636,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "force_cleanup":
+        await query.edit_message_text("🧹 <b>در حال بررسی و خروج از کانال/گروه‌های اسپانسر...</b>", parse_mode="HTML")
+        left_num = await cleanup_joined_channels({})
+        await query.edit_message_text(
+            f"✅ <b>پاکسازی انجام شد!</b>\nتعداد <b>{left_num}</b> کانال/گروه اسپانسر ترک و حذف شدند.",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
     if data == "clear_dups":
         settings["sent_media_ids"] = []
         save_settings()
         await query.edit_message_text(
-            "🧹 <b>حافظه ضد تکرار با موفقیت پاکسازی شد.</b>",
+            "🧹 <b>حافظه ضد تکرار با موفقیت صفر شد.</b>",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
@@ -1383,10 +1686,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_settings()
 
         await query.edit_message_text(
-            "✅ <b>مقصد انتخاب و ذخیره شد</b>\n\n"
-            f"📍 {settings['destination_name']}\n"
+            "✅ <b>مقصد با موفقیت انتخاب و قفل شد</b>\n\n"
+            f"📍 <b>{settings['destination_name']}</b>\n"
             f"📂 نوع: {dtype}\n\n"
-            "حالا لینک بفرست یا پستی که دکمه دانلود دارد را فوروارد کن.",
+            "حالا لینک بفرستید یا هر پستی که دکمه دانلود دارد را فوروارد کنید:",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
@@ -1418,7 +1721,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         link_queue.extend(selected)
         await query.edit_message_text(
-            f"✅ تعداد <b>{len(selected)}</b> لینک به صف پردازش اضافه شد.",
+            f"⚡ تعداد <b>{len(selected)}</b> مورد به صف پردازش فوری اضافه شد.",
             parse_mode="HTML",
         )
         asyncio.create_task(run_queue(query.message.chat_id, context))
@@ -1431,7 +1734,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "links":
         if not destination and not settings.get("destination_id"):
             await query.edit_message_text(
-                "❌ ابتدا مقصد را انتخاب کن.",
+                "❌ ابتدا مقصد را انتخاب کنید.",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("📍 انتخاب مقصد", callback_data="dest_menu")
                 ]]),
@@ -1440,8 +1743,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             "📥 <b>آماده دریافت لینک یا پست</b>\n\n"
-            f"📍 مقصد: <b>{settings.get('destination_name')}</b>\n\n"
-            "می‌توانی لینک بفرستی یا هر پستی (عکس/ویدیو/فایل دارای دکمه شیشه‌ای) را به اینجا فوروارد کنی.",
+            f"📍 مقصد فعلی: <b>{settings.get('destination_name')}</b>\n\n"
+            "کافیست لینک بفرستید یا پستی که زیرش دکمه شیشه‌ای دارد را به اینجا فوروارد کنید.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")
@@ -1453,7 +1756,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_requested = True
         link_queue.clear()
         await query.edit_message_text(
-            "🛑 <b>درخواست توقف ثبت شد و صف خالی گردید.</b>",
+            "🛑 <b>توقف فوری ثبت شد و صف انتظار خالی گردید.</b>",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
@@ -1500,7 +1803,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await restore_destination()
     if not destination:
         await msg.reply_text(
-            "❌ ابتدا مقصد را از منو انتخاب کن.",
+            "❌ ابتدا مقصد را از منوی زیر انتخاب کنید:",
             reply_markup=main_menu(),
         )
         return
@@ -1532,7 +1835,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons.append([
             InlineKeyboardButton(
-                f"🚀 دانلود همه موارد ({len(extracted_items)} لینک)",
+                f"🚀 دانلود خودکار همه ({len(extracted_items)} مورد)",
                 callback_data=f"batch:{b_id}:all",
             )
         ])
@@ -1541,8 +1844,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await msg.reply_text(
-            f"🔍 در این پست <b>{len(extracted_items)} دکمه/لینک</b> پیدا شد.\n"
-            "کدام مورد را می‌خواهی استخراج و به مقصد ارسال کنی؟",
+            f"🔍 در این پست <b>{len(extracted_items)} دکمه/لینک</b> شناسایی شد.\n"
+            "کدام مورد استخراج و به مقصد ارسال شود؟",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -1551,7 +1854,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link_queue.extend(extracted_items)
     if processing:
         await msg.reply_text(
-            f"➕ تعداد <b>{len(extracted_items)}</b> لینک به صف انتظار اضافه شد (مجموع صف: {len(link_queue)}).",
+            f"➕ تعداد <b>{len(extracted_items)}</b> لینک به صف اضافه شد (در صف: {len(link_queue)}).",
             parse_mode="HTML",
         )
     else:
@@ -1564,8 +1867,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    log(f"📩 Received /start from user_id: {user_id}")
-
     if not is_owner(update):
         await update.message.reply_text(
             f"⛔ دسترسی ندارید.\nآیدی عددی شما: <code>{user_id}</code>",
@@ -1584,7 +1885,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global tg
     log("================================")
-    log("🔌 Starting Bot & Connecting Telegram...")
+    log("🔌 Starting Ultra-Fast Bot & Connecting Telegram...")
 
     load_settings()
 
@@ -1616,7 +1917,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    log("🤖 Advanced Bot is running and polling for messages!")
+    log("🤖 Ultra-Fast Bot is running!")
     await asyncio.Event().wait()
 
 
