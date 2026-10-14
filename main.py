@@ -9,6 +9,9 @@ from telethon.errors import (
     FloodWaitError,
     UserAlreadyParticipantError,
     InviteRequestSentError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
 )
 from telethon.tl.functions.channels import (
     JoinChannelRequest,
@@ -75,12 +78,12 @@ default_settings = {
     "destination_id": None,
     "destination_name": None,
     "destination_type": None,
-    "button_mode": "prompt",      # "prompt" (پرسش قبل از دانلود) | "auto" (دانلود خودکار همه)
+    "button_mode": "prompt",      # "prompt" | "auto"
     "anti_duplicate": True,       # جلوگیری از ارسال فایل تکراری
     "auto_leave": True,           # خروج خودکار از کانال‌های جوین اجباری
     "caption_mode": "none",       # "none" | "clean" | "custom"
     "custom_caption": "",
-    "sent_media_ids": [],         # لیست شناسه‌های فایل‌های ارسال‌شده
+    "sent_media_ids": [],
 }
 
 settings = default_settings.copy()
@@ -90,7 +93,13 @@ processing = False
 stop_requested = False
 waiting_for_custom_caption = False
 
-# صف پردازش لینک‌ها و کش دکمه‌های انتخابی
+# وضعیت لاگین درون‌برنامه‌ای
+login_state = {
+    "step": None,          # None | "phone" | "code" | "2fa"
+    "phone": None,
+    "phone_code_hash": None,
+}
+
 link_queue = []
 pending_batches = {}
 batch_counter = 0
@@ -115,7 +124,6 @@ def load_settings():
 
 def save_settings():
     try:
-        # محدود کردن تاریخچه ضد تکرار به ۵۰۰۰ آیتم آخر برای حفظ سرعت
         if len(settings["sent_media_ids"]) > 5000:
             settings["sent_media_ids"] = settings["sent_media_ids"][-5000:]
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -126,6 +134,8 @@ def save_settings():
 
 async def restore_destination():
     global destination
+    if not await tg.is_user_authorized():
+        return
     dest_id = settings.get("destination_id")
     if not dest_id:
         return
@@ -324,7 +334,7 @@ async def show_settings(update: Update):
     custom_cap = settings.get("custom_caption") or "تنظیم نشده"
     text = (
         "⚙️ <b>تنظیمات هوشمند ربات</b>\n\n"
-        "• <b>حالت دکمه‌ها:</b> اگر پستی فوروارد کنید که چند دکمه دانلود (مثل کیفیت‌های مختلف) داشته باشد، از شما بپرسد یا همه را خودکار دانلود کند.\n"
+        "• <b>حالت دکمه‌ها:</b> اگر پستی فوروارد کنید که چند دکمه دانلود داشته باشد، از شما بپرسد یا همه را خودکار دانلود کند.\n"
         "• <b>ضد تکرار:</b> جلوگیری از ارسال مجدد عکس/ویدیو/فایل‌های تکراری.\n"
         "• <b>لفت خودکار:</b> خروج از کانال‌های اسپانسر بلافاصله پس از دریافت فایل.\n"
         f"• <b>کپشن اختصاصی فعلی:</b> <code>{custom_cap}</code>\n\n"
@@ -425,6 +435,104 @@ async def show_help(update: Update):
 
 
 # =========================================================
+# IN-BOT INTERACTIVE LOGIN HANDLER
+# =========================================================
+
+async def prompt_login(update: Update):
+    login_state["step"] = "phone"
+    text = (
+        "🔐 <b>ورود به اکانت تلگرام (Session)</b>\n\n"
+        "اکانت شما هنوز لاگین نشده است.\n"
+        "لطفاً <b>شماره موبایل</b> اکانت خود را به همراه پیش‌شماره کشور ارسال کنید:\n\n"
+        "مثال: <code>+989123456789</code>"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def handle_login_step(update: Update):
+    msg = update.message
+    text = (msg.text or "").strip()
+    step = login_state.get("step")
+
+    if step == "phone":
+        phone = re.sub(r"\s+", "", text)
+        if not phone.startswith("+"):
+            phone = "+" + phone
+        try:
+            sent = await tg.send_code_request(phone)
+            login_state["phone"] = phone
+            login_state["phone_code_hash"] = sent.phone_code_hash
+            login_state["step"] = "code"
+
+            await msg.reply_text(
+                "📩 <b>کد تایید به تلگرام شما ارسال شد!</b>\n\n"
+                "⚠️ <b>بسیار مهم:</b> برای اینکه تلگرام کد را به خاطر ارسال در چت باطل نکند، "
+                "حتماً <b>بین ارقام کد فاصله یا خط تیره بگذارید!</b>\n\n"
+                "مثال: <code>1 2 3 4 5</code> یا <code>1-2-3-4-5</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await msg.reply_text(
+                f"❌ خطا در ارسال کد:\n<code>{e}</code>\n\nدوباره شماره را با فرمت <code>+98912...</code> بفرستید:",
+                parse_mode="HTML",
+            )
+        return
+
+    if step == "code":
+        # حذف فاصله‌ها و خط تیره‌ها برای استخراج کد واقعی
+        code = re.sub(r"[^0-9]", "", text)
+        if not code:
+            await msg.reply_text("❌ کد نامعتبر است. لطفاً کد را با فاصله (مثل <code>1 2 3 4 5</code>) بفرستید:", parse_mode="HTML")
+            return
+
+        try:
+            await tg.sign_in(
+                phone=login_state["phone"],
+                code=code,
+                phone_code_hash=login_state["phone_code_hash"],
+            )
+            login_state["step"] = None
+            await restore_destination()
+            await msg.reply_text("✅ <b>ورود با موفقیت انجام شد و Session ذخیره گردید!</b>", parse_mode="HTML")
+            await show_home(update)
+
+        except SessionPasswordNeededError:
+            login_state["step"] = "2fa"
+            await msg.reply_text(
+                "🔑 <b>اکانت شما دارای رمز تایید دو مرحله‌ای (Two-Step Verification) است.</b>\n\n"
+                "لطفاً رمز دو مرحله‌ای خود را ارسال کنید:",
+                parse_mode="HTML",
+            )
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            login_state["step"] = "phone"
+            await msg.reply_text(
+                f"❌ کد وارد شده اشتباه یا منقضی شده است ({type(e).__name__}).\n"
+                "لطفاً دوباره شماره موبایل خود را بفرستید تا کد جدید ارسال شود:",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await msg.reply_text(f"❌ خطا در ورود:\n<code>{e}</code>", parse_mode="HTML")
+        return
+
+    if step == "2fa":
+        try:
+            await tg.sign_in(password=text)
+            login_state["step"] = None
+            await restore_destination()
+            await msg.reply_text("✅ <b>ورود دو مرحله‌ای با موفقیت انجام شد و Session ذخیره گردید!</b>", parse_mode="HTML")
+            await show_home(update)
+        except Exception as e:
+            await msg.reply_text(
+                f"❌ رمز دو مرحله‌ای اشتباه است یا خطایی رخ داد:\n<code>{e}</code>\n\nدوباره رمز را ارسال کنید:",
+                parse_mode="HTML",
+            )
+        return
+
+
+# =========================================================
 # LINK & BUTTON EXTRACTION FROM USER MESSAGES
 # =========================================================
 
@@ -443,13 +551,6 @@ def is_valid_tg_link(url: str) -> bool:
 
 
 def extract_items_from_message(msg) -> list:
-    """
-    استخراج تمام لینک‌های تلگرام از:
-    ۱. دکمه‌های شیشه‌ای زیر پست (Inline Keyboard)
-    ۲. لینک‌های مخفی داخل متن و کپشن (Entities / Hyperlinks)
-    ۳. متن ساده و کپشن عکس/ویدیو/فایل
-    خروجی: لیستی از دیکشنری‌ها [{"title": "...", "url": "..."}]
-    """
     items = []
     seen_urls = set()
 
@@ -461,14 +562,12 @@ def extract_items_from_message(msg) -> list:
             seen_urls.add(url)
             items.append({"title": title or "لینک استخراج‌شده", "url": url})
 
-    # ۱. بررسی دکمه‌های شیشه‌ای (Inline Keyboard)
     if msg.reply_markup and getattr(msg.reply_markup, "inline_keyboard", None):
         for row in msg.reply_markup.inline_keyboard:
             for btn in row:
                 if getattr(btn, "url", None):
                     add_item(btn.text, btn.url)
 
-    # ۲. بررسی Entities در متن یا کپشن (Hyperlinks)
     text_content = msg.text or msg.caption or ""
     entities = list(msg.entities or []) + list(msg.caption_entities or [])
     for ent in entities:
@@ -476,7 +575,6 @@ def extract_items_from_message(msg) -> list:
             label = text_content[ent.offset : ent.offset + ent.length]
             add_item(label, ent.url)
 
-    # ۳. بررسی لینک‌های متنی آشکار در متن و کپشن
     pattern = r"https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+"
     for match in re.finditer(pattern, text_content, re.IGNORECASE):
         add_item("لینک متنی", match.group(0))
@@ -489,14 +587,6 @@ def extract_items_from_message(msg) -> list:
 # =========================================================
 
 def parse_tg_link(link: str):
-    """
-    تشخیص نوع لینک تلگرام:
-    - bot_start: لینک ربات دارای پارامتر یا بدون پارامتر
-    - private_post: لینک پست کانال خصوصی (t.me/c/123456/789)
-    - public_post: لینک پست کانال عمومی (t.me/channel/123)
-    - invite: لینک عضویت خصوصی (t.me/+xxx یا t.me/joinchat/xxx)
-    """
-    # لینک پست کانال خصوصی
     m_priv = re.search(
         r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)", link, re.IGNORECASE
     )
@@ -507,7 +597,6 @@ def parse_tg_link(link: str):
             "msg_id": int(m_priv.group(2)),
         }
 
-    # لینک دعوت خصوصی
     m_inv = re.search(
         r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)",
         link,
@@ -519,7 +608,6 @@ def parse_tg_link(link: str):
             "hash": m_inv.group(1),
         }
 
-    # لینک پست کانال عمومی
     m_pub = re.search(
         r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/(\d+)",
         link,
@@ -532,7 +620,6 @@ def parse_tg_link(link: str):
             "msg_id": int(m_pub.group(2)),
         }
 
-    # لینک ربات یا یوزرنیم
     m_bot = re.search(
         r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)(?:\?(?:start|startgroup)=([^&\s]+))?",
         link,
@@ -553,7 +640,6 @@ def parse_tg_link(link: str):
 # =========================================================
 
 def is_real_media(message) -> bool:
-    """تشخیص رسانه واقعی (عکس، ویدیو، فایل، ویس، موزیک، گیف) و نادیده گرفتن پیش‌نمایش وب"""
     if not message or not message.media:
         return False
     if isinstance(message.media, (MessageMediaWebPage, MessageMediaEmpty)):
@@ -562,7 +648,6 @@ def is_real_media(message) -> bool:
 
 
 def get_media_unique_id(message):
-    """استخراج شناسه یکتای رسانه برای سیستم ضد تکرار"""
     if not message or not message.media:
         return None
     doc = getattr(message.media, "document", None)
@@ -599,7 +684,6 @@ def build_caption(original_text: str):
     if mode == "clean":
         if not original_text:
             return None
-        # حذف لینک‌ها و آیدی‌های تبلیغاتی از کپشن اصلی
         cleaned = re.sub(r"https?://[^\s]+", "", original_text)
         cleaned = re.sub(r"(?:t\.me|telegram\.me)/[^\s]+", "", cleaned)
         cleaned = re.sub(r"@[A-Za-z0-9_]+", "", cleaned)
@@ -613,10 +697,6 @@ def build_caption(original_text: str):
 # =========================================================
 
 async def send_media_group_or_single(messages_list):
-    """
-    ارسال تکی یا آلبومی (Media Group) انواع عکس، ویدیو و فایل
-    به همراه پشتیبانی از کانال‌ها و ربات‌های دارای قفل فوروارد (Restricted Content)
-    """
     global destination
     if destination is None:
         await restore_destination()
@@ -643,7 +723,6 @@ async def send_media_group_or_single(messages_list):
             "error": "همه فایل‌ها تکراری بودند." if skipped_dups > 0 else "مدیای معتبری یافت نشد.",
         }
 
-    # آماده‌سازی کپشن
     captions = [build_caption(m.message or "") for m in valid_messages]
     media_files = [m.media for m in valid_messages]
 
@@ -656,7 +735,6 @@ async def send_media_group_or_single(messages_list):
                 force_document=False,
             )
         else:
-            # ارسال به صورت آلبوم یکپارچه
             first_cap = next((c for c in captions if c), None)
             sent = await tg.send_file(
                 entity=destination,
@@ -677,7 +755,6 @@ async def send_media_group_or_single(messages_list):
         return await send_media_group_or_single(valid_messages)
 
     except Exception as e:
-        # در صورتی که فایل قفل فوروارد داشته باشد (ChatForwardsRestrictedError)، دانلود و آپلود مجدد می‌شود
         print(f"⚠️ Direct send failed ({type(e).__name__}), trying download & re-upload...")
         sent_count = 0
         for idx, m in enumerate(valid_messages):
@@ -712,7 +789,7 @@ async def send_media_group_or_single(messages_list):
 
 
 # =========================================================
-# AUTO-JOIN, TIMER & STEP-BUTTON ENGINE (مورد د)
+# AUTO-JOIN, TIMER & STEP-BUTTON ENGINE
 # =========================================================
 
 VERIFY_KEYWORDS = [
@@ -724,7 +801,6 @@ VERIFY_KEYWORDS = [
 
 
 def detect_wait_timer(text: str) -> int:
-    """تشخیص تایمر در متن پیام ربات مبدا (مثلاً: لطفاً ۱۵ ثانیه صبر کنید)"""
     if not text:
         return 0
     m = re.search(
@@ -740,7 +816,6 @@ def detect_wait_timer(text: str) -> int:
 
 
 async def join_sponsor_link(url: str, joined_channels: list) -> bool:
-    """عضویت خودکار در کانال یا گروه اسپانسر (عمومی یا خصوصی)"""
     parsed = parse_tg_link(url)
     if not parsed:
         return False
@@ -756,7 +831,6 @@ async def join_sponsor_link(url: str, joined_channels: list) -> bool:
 
         if parsed["type"] in ("bot_or_entity", "public_post"):
             username = parsed["username"]
-            # اگر یوزرنیم به bot ختم شود، کانال نیست بلکه ربات است
             if username.lower().endswith("bot"):
                 return False
             entity = await tg.get_entity(username)
@@ -780,7 +854,6 @@ async def join_sponsor_link(url: str, joined_channels: list) -> bool:
 
 
 async def cleanup_joined_channels(joined_channels: list):
-    """خروج خودکار از کانال‌های تبلیغاتی پس از اتمام دریافت فایل‌ها"""
     if not settings.get("auto_leave", True) or not joined_channels:
         return
     for entity in joined_channels:
@@ -798,16 +871,8 @@ async def inspect_and_interact_with_bot_message(
     joined_channels: list,
     clicked_buttons: set,
 ):
-    """
-    بررسی هوشمند پیام‌های ربات مبدا:
-    ۱. تشخیص تایمر و صبر کردن خودکار
-    ۲. پیدا کردن لینک کانال‌های جوین اجباری (در دکمه‌ها و متن) و عضویت در آن‌ها
-    ۳. تشخیص لینک پرش به ربات بعدی (Multi-Hop Bot)
-    ۴. کلیک خودکار روی دکمه‌های تایید عضویت یا دکمه‌های مرحله‌ای (دریافت فایل / ادامه)
-    """
     text = msg.message or ""
 
-    # ۱. بررسی تایمر
     wait_sec = detect_wait_timer(text)
     if wait_sec > 0:
         print(f"⏱ Timer detected in bot message! Waiting {wait_sec}s...")
@@ -817,7 +882,6 @@ async def inspect_and_interact_with_bot_message(
     joined_any = False
     re_start_url = None
 
-    # ۲. اسکن دکمه‌های شیشه‌ای پیام ربات
     if msg.reply_markup and hasattr(msg.reply_markup, "rows"):
         for r_idx, row in enumerate(msg.reply_markup.rows):
             for b_idx, btn in enumerate(row.buttons):
@@ -826,7 +890,6 @@ async def inspect_and_interact_with_bot_message(
                     if not parsed:
                         continue
 
-                    # بررسی اینکه آیا دکمه به خودِ همین ربات اشاره دارد (دکمه تایید از نوع URL)
                     if (
                         parsed["type"] == "bot_or_entity"
                         and parsed["username"].lower() == current_bot_username.lower()
@@ -834,7 +897,6 @@ async def inspect_and_interact_with_bot_message(
                         re_start_url = btn.url
                         continue
 
-                    # بررسی اینکه آیا دکمه به یک ربات دیگر (ربات دوم) اشاره دارد
                     if parsed["type"] == "bot_or_entity" and (
                         parsed["payload"] or parsed["username"].lower().endswith("bot")
                     ):
@@ -846,12 +908,10 @@ async def inspect_and_interact_with_bot_message(
                         except Exception:
                             pass
 
-                    # در غیر این صورت، کانال یا گروه اسپانسر است -> عضویت خودکار
                     did_join = await join_sponsor_link(btn.url, joined_channels)
                     if did_join:
                         joined_any = True
 
-    # ۳. اسکن لینک‌های داخل متن پیام (اگر کانال اسپانسر را در متن گذاشته باشند)
     for match in re.finditer(
         r"https?://(?:www\.)?(?:t\.me|telegram\.me)/[^\s]+", text, re.IGNORECASE
     ):
@@ -867,7 +927,6 @@ async def inspect_and_interact_with_bot_message(
             if did_join:
                 joined_any = True
 
-    # ۴. کلیک خودکار روی دکمه تایید عضویت یا دکمه‌های مرحله‌ای (مورد د)
     if msg.reply_markup and hasattr(msg.reply_markup, "rows"):
         target_callback = None
         fallback_callback = None
@@ -913,7 +972,6 @@ async def inspect_and_interact_with_bot_message(
 # =========================================================
 
 async def process_channel_post(parsed_info):
-    """کپی مستقیم پست یا آلبوم از کانال‌های عمومی و خصوصی"""
     try:
         target = (
             parsed_info["chat_id"]
@@ -927,7 +985,6 @@ async def process_channel_post(parsed_info):
         if not msg:
             return {"success": False, "count": 0, "skipped": 0, "reason": "پست یافت نشد."}
 
-        # بررسی اینکه آیا پست بخشی از یک آلبوم (Media Group) است
         if getattr(msg, "grouped_id", None):
             surrounding = await tg.get_messages(
                 entity,
@@ -952,12 +1009,6 @@ async def process_channel_post(parsed_info):
 
 
 async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
-    """
-    موتور اصلی پردازش لینک با پشتیبانی از:
-    - پست کانال‌ها
-    - ربات‌های آپلودر، جوین اجباری، تایمر، دکمه‌های مرحله‌ای و پرش به ربات‌های بعدی
-    - تجمیع آلبوم‌ها و ارسال انواع رسانه
-    """
     if joined_channels is None:
         joined_channels = []
 
@@ -978,7 +1029,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
             "reason": "لینک تلگرام معتبر نیست.",
         }
 
-    # اگر لینک مستقیم پست کانال باشد
     if parsed["type"] in ("private_post", "public_post"):
         return await process_channel_post(parsed)
 
@@ -998,7 +1048,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
-    # ارسال دستور /start به ربات مبدا
     try:
         command = f"/start {payload}" if payload else "/start"
         request = await tg.send_message(bot, command)
@@ -1031,7 +1080,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
 
             messages = list(reversed(messages))
 
-            # دسته‌بندی رسانه‌ها برای پشتیبانی از آلبوم (grouped_id)
             media_batches = []
             current_group_id = None
             current_group_list = []
@@ -1062,7 +1110,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                             current_group_id = None
                         media_batches.append([message])
                 else:
-                    # پیام متنی یا مرحله‌ای است -> بررسی جوین اجباری، تایمر و دکمه‌ها
                     hops = await inspect_and_interact_with_bot_message(
                         message,
                         username,
@@ -1075,11 +1122,9 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                             last_activity_time = asyncio.get_running_loop().time()
 
             if current_group_list:
-                # کمی صبر برای تکمیل شدن پیام‌های آلبوم
                 await asyncio.sleep(1.5)
                 media_batches.append(current_group_list)
 
-            # ارسال دسته‌های رسانه به مقصد
             for batch in media_batches:
                 res = await send_media_group_or_single(batch)
                 if res["success"]:
@@ -1090,7 +1135,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                     skipped_dups += res.get("skipped", 0)
                     print("❌ Media batch error:", res["error"])
 
-            # اگر هیچ فایلی نیامد اما لینک پرش به ربات بعدی پیدا شد، بلافاصله به ربات بعدی بپر
             if media_count == 0 and discovered_bot_hops:
                 next_link = discovered_bot_hops.pop(0)
                 print(f"🔀 Hopping to next bot link: {next_link}")
@@ -1104,7 +1148,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
                 if hop_res["success"]:
                     break
 
-            # خروج هوشمند در صورت اتمام ارسال فایل‌ها
             if (
                 (media_count > 0 or skipped_dups > 0)
                 and (asyncio.get_running_loop().time() - last_activity_time)
@@ -1115,7 +1158,6 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
             await asyncio.sleep(1.5)
 
     finally:
-        # در سطح اول، پس از اتمام کار از کانال‌های اسپانسر خارج شو
         if hop_depth == 0 and joined_channels:
             await cleanup_joined_channels(joined_channels)
 
@@ -1131,7 +1173,7 @@ async def process_one_link(link: str, hop_depth: int = 0, joined_channels=None):
         "success": False,
         "count": 0,
         "skipped": 0,
-        "reason": "فایلی دریافت نشد (ممکن است ربات مبدا خاموش باشد یا کپچای تصویری داشته باشد).",
+        "reason": "فایلی دریافت نشد.",
     }
 
 
@@ -1232,6 +1274,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
+
+    if not await tg.is_user_authorized():
+        await prompt_login(update)
+        return
+
     data = query.data
 
     if data == "home":
@@ -1324,9 +1371,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # -----------------------------------------------------
-    # انتخابگر هوشمند دکمه‌ها (مورد الف)
-    # -----------------------------------------------------
     if data.startswith("batch:"):
         _, batch_id_str, action = data.split(":")
         batch_id = int(batch_id_str)
@@ -1400,7 +1444,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# UNIVERSAL MESSAGE HANDLER (TEXT, PHOTO, VIDEO, FILE, BUTTONS)
+# UNIVERSAL MESSAGE HANDLER
 # =========================================================
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1409,9 +1453,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update) or not update.message:
         return
 
+    # اگر اکانت هنوز لاگین نیست، پیام‌های متنی را به پروسه لاگین بفرست
+    if not await tg.is_user_authorized():
+        if login_state.get("step"):
+            await handle_login_step(update)
+        else:
+            await prompt_login(update)
+        return
+
     msg = update.message
 
-    # اگر در حالت دریافت متن کپشن اختصاصی هستیم
     if waiting_for_custom_caption and msg.text:
         waiting_for_custom_caption = False
         settings["custom_caption"] = msg.text.strip()
@@ -1434,7 +1485,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # استخراج تمام لینک‌ها از دکمه‌های شیشه‌ای، هایپرلینک‌ها و متن/کپشن پست
     extracted_items = extract_items_from_message(msg)
 
     if not extracted_items:
@@ -1443,7 +1493,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # مورد الف: اگر بیش از ۱ لینک/دکمه در پست وجود داشت و حالت پرسش فعال بود
     if len(extracted_items) > 1 and settings.get("button_mode") == "prompt":
         batch_counter += 1
         b_id = batch_counter
@@ -1479,7 +1528,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # اگر ۱ لینک بود یا حالت دانلود خودکار همه فعال بود -> افزودن مستقیم به صف
     link_queue.extend(extracted_items)
     if processing:
         await msg.reply_text(
@@ -1499,8 +1547,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ دسترسی ندارید.")
         return
     if not await tg.is_user_authorized():
-        await update.message.reply_text("❌ Session اکانت Telegram معتبر نیست.")
+        await prompt_login(update)
         return
+    login_state["step"] = None
     await show_home(update)
 
 
@@ -1511,14 +1560,13 @@ async def main():
     load_settings()
     await tg.connect()
 
-    if not await tg.is_user_authorized():
-        print("❌ Telegram Session is NOT authorized.")
-        return
+    if await tg.is_user_authorized():
+        me = await tg.get_me()
+        print(f"✅ Telegram Session connected: {me.first_name or ''} ({me.id})")
+        await restore_destination()
+    else:
+        print("⚠️ Telegram Session is NOT authorized yet. Send /start to the bot in Telegram to log in!")
 
-    me = await tg.get_me()
-    print(f"✅ Telegram Session connected: {me.first_name or ''} ({me.id})")
-
-    await restore_destination()
     print("================================")
 
     app = Application.builder().token(BOT_TOKEN).build()
