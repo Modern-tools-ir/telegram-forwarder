@@ -1,10 +1,13 @@
 import os
 import re
+import gc
 import sys
 import json
 import time
+import shutil
 import asyncio
 import tempfile
+import subprocess
 import urllib.request
 
 from telethon import TelegramClient
@@ -53,7 +56,6 @@ API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "7504234770").strip())
 
-# آدرس مستقیم فایل main.py در مخزن گیت‌هاب شما برای آپدیت خودکار
 GITHUB_RAW_URL = os.environ.get(
     "GITHUB_RAW_URL",
     "https://raw.githubusercontent.com/Modern-tools-ir/telegram-forwarder/main/main.py",
@@ -80,11 +82,12 @@ except Exception:
 SESSION_FILE = os.path.join(DATA_DIR, "telegram")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-WAIT_SECONDS = 50
-AFTER_MEDIA_WAIT = 2.8
-POLL_INTERVAL = 0.3
+WAIT_SECONDS = 45
+AFTER_MEDIA_WAIT = 2.5
+POLL_INTERVAL = 0.35
 PAGE_SIZE = 8
 MAX_BOT_HOPS = 4
+BOT_START_TIME = time.time()
 
 tg: TelegramClient = None
 
@@ -160,7 +163,7 @@ async def restore_destination():
     if not dest_id:
         return
     try:
-        destination = await tg.get_entity(dest_id)
+        destination = await asyncio.wait_for(tg.get_entity(dest_id), timeout=8.0)
         log(f"✅ Restored destination: {settings.get('destination_name')} ({dest_id})")
     except Exception:
         await load_destinations()
@@ -173,23 +176,166 @@ async def restore_destination():
 
 
 # =========================================================
-# SELF-UPDATE & RESTART ENGINE
+# SERVER MANAGEMENT & DIAGNOSTICS ENGINE (AWS UBUNTU)
 # =========================================================
 
+def format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days} روز")
+    if hours > 0:
+        parts.append(f"{hours} ساعت")
+    if mins > 0:
+        parts.append(f"{mins} دقیقه")
+    if not parts:
+        parts.append(f"{secs} ثانیه")
+    return " و ".join(parts)
+
+
+async def get_server_stats_text() -> str:
+    # ۱. محاسبه پینگ تلگرام
+    t0 = time.perf_counter()
+    try:
+        await asyncio.wait_for(tg.get_me(), timeout=5.0)
+        ping_ms = int((time.perf_counter() - t0) * 1000)
+        ping_str = f"{ping_ms} ms ⚡"
+    except Exception:
+        ping_str = "نامشخص"
+
+    # ۲. مصرف RAM از /proc/meminfo
+    ram_str = "نامشخص"
+    try:
+        mem_info = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = int(parts[1].strip().split()[0])
+                    mem_info[key] = val
+        total_mb = mem_info.get("MemTotal", 0) // 1024
+        avail_mb = mem_info.get("MemAvailable", mem_info.get("MemFree", 0)) // 1024
+        used_mb = max(0, total_mb - avail_mb)
+        pct = int((used_mb / total_mb) * 100) if total_mb else 0
+        ram_str = f"{used_mb} MB / {total_mb} MB ({pct}%)"
+    except Exception:
+        pass
+
+    # ۳. بار پردازنده (CPU Load)
+    cpu_str = "نامشخص"
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cores = os.cpu_count() or 1
+        cpu_pct = min(100, int((load1 / cores) * 100))
+        cpu_str = f"{cpu_pct}% (Load: {load1:.2f} | هسته‌ها: {cores})"
+    except Exception:
+        pass
+
+    # ۴. فضای دیسک
+    disk_str = "نامشخص"
+    try:
+        total_b, used_b, free_b = shutil.disk_usage("/")
+        total_gb = total_b / (1024 ** 3)
+        used_gb = used_b / (1024 ** 3)
+        free_gb = free_b / (1024 ** 3)
+        disk_pct = int((used_b / total_b) * 100) if total_b else 0
+        disk_str = f"{used_gb:.1f} GB / {total_gb:.1f} GB ({disk_pct}% پر - {free_gb:.1f} GB خالی)"
+    except Exception:
+        pass
+
+    # ۵. آپتایم سرور و ربات
+    sys_uptime_str = "نامشخص"
+    try:
+        with open("/proc/uptime", "r") as f:
+            up_sec = float(f.read().split()[0])
+            sys_uptime_str = format_uptime(up_sec)
+    except Exception:
+        pass
+
+    bot_uptime_str = format_uptime(time.time() - BOT_START_TIME)
+    py_ver = sys.version.split()[0]
+
+    return (
+        "🖥 <b>داشبورد مدیریت سرور (AWS Ubuntu)</b>\n\n"
+        f"📡 <b>پینگ دیتاسنتر تلگرام:</b> <code>{ping_str}</code>\n"
+        f"🧠 <b>مصرف رم (RAM):</b> <code>{ram_str}</code>\n"
+        f"⚙️ <b>پردازنده (CPU):</b> <code>{cpu_str}</code>\n"
+        f"💿 <b>فضای هارد (Disk):</b> <code>{disk_str}</code>\n\n"
+        f"⏱ <b>آپتایم سرور لینوکس:</b> <b>{sys_uptime_str}</b>\n"
+        f"🤖 <b>آپتایم ربات:</b> <b>{bot_uptime_str}</b>\n"
+        f"🐍 <b>نسخه پایتون:</b> <code>Python {py_ver}</code>\n\n"
+        "از دکمه‌های زیر برای مدیریت مستقیم سرور استفاده کنید:"
+    )
+
+
+def get_recent_service_logs(lines: int = 25) -> str:
+    try:
+        out = subprocess.check_output(
+            ["journalctl", "-u", "tgbot", "-n", str(lines), "--no-pager"],
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        ).decode("utf-8", errors="replace")
+        # کوتاه کردن خطوط برای نمایش تمیز در تلگرام
+        cleaned_lines = []
+        for ln in out.splitlines():
+            if "python[" in ln:
+                ln = ln.split("python[", 1)[-1]
+                if "]: " in ln:
+                    ln = ln.split("]: ", 1)[-1]
+            cleaned_lines.append(ln)
+        res = "\n".join(cleaned_lines[-lines:])
+        return res[-3500:] if res else "لاگی یافت نشد."
+    except Exception as e:
+        return f"خطا در خواندن لاگ: {e}"
+
+
+def clean_server_temp_files() -> str:
+    removed_files = 0
+    freed_bytes = 0
+    try:
+        for root_dir in ("/tmp", "/var/tmp"):
+            if not os.path.exists(root_dir):
+                continue
+            for item in os.listdir(root_dir):
+                full_p = os.path.join(root_dir, item)
+                if item.startswith("tmp") or item.endswith(".tmp") or item.endswith(".part"):
+                    try:
+                        if os.path.isfile(full_p):
+                            sz = os.path.getsize(full_p)
+                            os.remove(full_p)
+                            freed_bytes += sz
+                            removed_files += 1
+                    except Exception:
+                        pass
+        gc.collect()
+        # خالی کردن کش رم لینوکس در صورت دسترسی root
+        try:
+            subprocess.run("sync && echo 3 > /proc/sys/vm/drop_caches", shell=True, timeout=3)
+        except Exception:
+            pass
+    except Exception as e:
+        return f"خطا در پاکسازی: {e}"
+
+    freed_mb = freed_bytes / (1024 * 1024)
+    return f"تعداد {removed_files} فایل موقت حذف شد ({freed_mb:.2f} مگابایت) و کش رم سرور آزاد گردید."
+
+
 async def restart_bot_process():
-    """قطع اتصال ایمن سشن تلگرام و ری‌استارت فوری پروسه پایتون"""
     log("🔄 Restarting bot process...")
     try:
         if tg and tg.is_connected():
             await tg.disconnect()
     except Exception:
         pass
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.4)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def fetch_latest_code_from_github() -> str:
-    """دانلود آخرین نسخه main.py از مخزن گیت‌هاب بدون کش"""
     url = f"{GITHUB_RAW_URL}?t={int(time.time())}"
     req = urllib.request.Request(
         url,
@@ -226,7 +372,7 @@ def main_menu():
         ],
         [
             InlineKeyboardButton("⚙️ تنظیمات هوشمند", callback_data="settings_menu"),
-            InlineKeyboardButton("📥 ارسال لینک/پست", callback_data="links"),
+            InlineKeyboardButton("🖥 مدیریت سرور (AWS)", callback_data="server_menu"),
         ],
         [
             InlineKeyboardButton("🚪 پاکسازی اسپانسرها", callback_data="force_cleanup"),
@@ -238,6 +384,26 @@ def main_menu():
         [
             InlineKeyboardButton("🛑 توقف و خالی کردن صف", callback_data="stop"),
             InlineKeyboardButton("❓ راهنما", callback_data="help"),
+        ],
+    ])
+
+
+def server_control_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 بروزرسانی آمار سرور", callback_data="server_menu"),
+            InlineKeyboardButton("📜 مشاهده لاگ زنده", callback_data="server_logs"),
+        ],
+        [
+            InlineKeyboardButton("🧹 پاکسازی کش و رم سرور", callback_data="server_clean"),
+            InlineKeyboardButton("♻️ ری‌استارت سرویس ربات", callback_data="server_restart_bot"),
+        ],
+        [
+            InlineKeyboardButton("🔄 آپدیت کد از گیت‌هاب", callback_data="self_update"),
+            InlineKeyboardButton("🔥 ریبوت کل سرور (Ubuntu)", callback_data="server_reboot_confirm"),
+        ],
+        [
+            InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home"),
         ],
     ])
 
@@ -335,7 +501,7 @@ async def load_destinations():
 async def take_chats_snapshot() -> set:
     chat_ids = set()
     try:
-        async for dialog in tg.iter_dialogs(limit=250):
+        async for dialog in tg.iter_dialogs(limit=220):
             ent = dialog.entity
             if getattr(ent, "broadcast", False) or getattr(ent, "megagroup", False) or ent.__class__.__name__ == "Chat":
                 chat_ids.add(ent.id)
@@ -395,7 +561,7 @@ async def show_home(update: Update):
         f"📡 <b>وضعیت:</b> {state_icon} | <b>صف:</b> {len(link_queue)} لینک\n"
         f"🧭 <b>آخرین مرحله:</b> <i>{current_live_step}</i>\n"
         f"🛡 <b>آرشیو ضدتکرار:</b> {len(settings['sent_media_ids'])} فایل\n\n"
-        "💡 <i>هر لینک یا پستی را بفرستید، یا برای بروزرسانی ربات دکمه آپدیت را بزنید:</i>"
+        "💡 <i>لینک یا پست دارای دکمه را بفرستید، یا از منوی زیر مدیریت کنید:</i>"
     )
 
     if update.callback_query:
@@ -413,7 +579,7 @@ async def show_settings(update: Update):
     text = (
         "⚙️ <b>تنظیمات هوشمند ربات</b>\n\n"
         "• <b>دکمه‌های پست:</b> انتخاب کیفیت/دکمه قبل از دانلود یا دانلود خودکار همه.\n"
-        "• <b>حذف خودکار اسپانسر:</b> خروج و پاکسازی فوری تمام کانال‌ها و گروه‌های جوین اجباری (حتی خصوصی و تایید خودکار) به محض دریافت فایل.\n"
+        "• <b>حذف خودکار اسپانسر:</b> خروج و پاکسازی فوری تمام کانال‌ها و گروه‌های جوین اجباری به محض دریافت فایل.\n"
         "• <b>ضد تکرار:</b> جلوگیری از ارسال فایل‌های تکراری.\n"
         f"• <b>کپشن اختصاصی:</b> <code>{custom_cap}</code>\n\n"
         "برای تغییر هر گزینه روی دکمه آن بزنید:"
@@ -499,10 +665,9 @@ async def show_status(update: Update):
 async def show_help(update: Update):
     text = (
         "❓ <b>راهنمای نسخه فوق سریع و هوشمند</b>\n\n"
-        "🔄 <b>آپدیت خودکار:</b> با زدن دکمه «آپدیت خودکار ربات» در منوی اصلی، آخرین کدهای فایل <code>main.py</code> از گیت‌هاب شما دانلود و نصب می‌شود. همچنین می‌توانید فایل <code>main.py</code> را مستقیم در چت بفرستید تا آپدیت شود.\n\n"
-        "⚡ <b>ارسال فوری بدون تاخیر:</b> ربات به محض دیدن عکس، ویدیو یا فایل، در کمتر از نیم ثانیه آن را به مقصد می‌فرستد.\n\n"
-        "🔒 <b>پشتیبانی از کانال/گروه‌های خصوصی و درخواستی:</b> عضویت همزمان، انتظار برای تایید خودکار و حذف صددرصدی پس از اتمام کار.\n\n"
-        "🧭 <b>نمایش زنده مراحل:</b> مشاهده لحظه‌ای کارهای ربات روی پیام وضعیت."
+        "🖥 <b>مدیریت سرور AWS:</b> از منوی اصلی وارد بخش مدیریت سرور شوید تا مصرف رم، سی‌پی‌یو، پینگ تلگرام و لاگ‌های زنده سرور را ببینید یا کش سرور را پاک کنید.\n\n"
+        "🔄 <b>آپدیت خودکار:</b> با زدن دکمه «آپدیت خودکار ربات» یا ارسال مستقیم فایل <code>main.py</code> در چت، ربات کدهای خود را آپدیت و ری‌استارت می‌کند.\n\n"
+        "⚡ <b>ضد گیر کردن در جوین اجباری:</b> پشتیبانی کامل از دکمه‌های تایید شیشه‌ای، دکمه‌های تایید لینک‌دار (Restart URL)، ربات‌های اسپانسر و کانال‌های درخواستی."
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home")
@@ -613,6 +778,21 @@ async def handle_login_step(update: Update):
 # LINK & BUTTON EXTRACTION
 # =========================================================
 
+def normalize_persian(text: str) -> str:
+    if not text:
+        return ""
+    return (
+        text.replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("ئ", "ی")
+        .replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("ؤ", "و")
+        .replace("\u200c", " ")
+        .strip()
+    )
+
+
 def normalize_tg_url(url: str) -> str:
     if not url:
         return ""
@@ -682,6 +862,10 @@ def parse_tg_link(raw_link: str):
     link = normalize_tg_url(raw_link)
     if not link:
         return None
+
+    # نادیده گرفتن لینک‌های فولدر تلگرام (addlist) که باعث هنگ get_entity می‌شوند
+    if re.search(r"(?:t\.me|telegram\.me)/addlist/", link, re.IGNORECASE):
+        return {"type": "folder", "url": link}
 
     m_priv = re.search(
         r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)", link, re.IGNORECASE
@@ -853,8 +1037,10 @@ async def send_media_group_or_single(messages_list):
 
     except FloodWaitError as e:
         log(f"⏳ FloodWait during send: {e.seconds}s")
-        await asyncio.sleep(e.seconds + 0.5)
-        return await send_media_group_or_single(valid_messages)
+        if e.seconds <= 15:
+            await asyncio.sleep(e.seconds + 0.5)
+            return await send_media_group_or_single(valid_messages)
+        return {"success": False, "count": 0, "skipped": skipped_dups, "error": f"محدودیت تلگرام ({e.seconds}s)"}
 
     except Exception as e:
         err_str = str(e).lower()
@@ -895,15 +1081,15 @@ async def send_media_group_or_single(messages_list):
 
 
 # =========================================================
-# PARALLEL SPONSOR JOIN & SNAPSHOT CLEANUP
+# TIMEOUT-PROTECTED SPONSOR JOIN & SNAPSHOT CLEANUP
 # =========================================================
 
 VERIFY_KEYWORDS = [
-    "تایید", "تأیید", "بررسی", "عضو شدم", "جوین شدم", "دریافت",
-    "دانلود", "ادامه", "بعدی", "بخش", "قسمت", "کیفیت", "فایل",
-    "پارت", "مشاهده", "کلیک", "باز کردن", "ورود", "عضویت",
+    "تایید", "تأیید", "تائید", "بررسی", "عضو شدم", "عضوشدم", "جوین شدم",
+    "جوینشدم", "دریافت", "دانلود", "ادامه", "بعدی", "بخش", "قسمت", "کیفیت",
+    "فایل", "پارت", "مشاهده", "کلیک", "باز کردن", "ورود", "عضویت", "چک",
     "check", "verify", "joined", "continue", "download", "get",
-    "start", "try again", "unlock", "✅", "🔄", "📥", "📂", "🎬",
+    "start", "try again", "unlock", "confirm", "✅", "🔄", "📥", "📂", "🎬", "☑️", "✔️",
 ]
 
 SELF_DESTRUCT_WORDS = [
@@ -912,11 +1098,16 @@ SELF_DESTRUCT_WORDS = [
     "delete", "remove", "save", "forward", "expire", "destruct",
 ]
 
+FORCE_JOIN_HINTS = [
+    "عضو", "جوین", "کانال", "گروه", "اسپانسر", "قفل", "ابتدا", "حمایت",
+    "join", "channel", "sponsor", "subscribe", "first",
+]
+
 
 def detect_wait_timer(text: str) -> int:
     if not text:
         return 0
-    low = text.lower()
+    low = normalize_persian(text).lower()
     if any(w in low for w in SELF_DESTRUCT_WORDS):
         return 0
 
@@ -927,7 +1118,7 @@ def detect_wait_timer(text: str) -> int:
         )
         if m:
             sec = int(m.group(1))
-            if 1 <= sec <= 12:
+            if 1 <= sec <= 10:
                 return sec
     return 0
 
@@ -950,12 +1141,13 @@ def register_sponsor_for_cleanup(entity):
         save_settings()
 
 
-async def join_single_sponsor(url: str, joined_entities: dict) -> dict:
+async def _do_join_single_sponsor(url: str, joined_entities: dict) -> dict:
     parsed = parse_tg_link(url)
-    if not parsed:
-        return {"joined": False, "is_request": False}
+    if not parsed or parsed["type"] == "folder":
+        return {"joined": True, "is_request": False}
 
     try:
+        # ۱. لینک دعوت خصوصی یا درخواستی
         if parsed["type"] == "invite":
             inv_hash = parsed["hash"]
             try:
@@ -976,13 +1168,18 @@ async def join_single_sponsor(url: str, joined_entities: dict) -> dict:
             log(f"✅ Joined private sponsor: {inv_hash}")
             return {"joined": True, "is_request": False}
 
+        # ۲. لینک عمومی کانال، گروه یا رباتِ اسپانسر
         if parsed["type"] in ("bot_or_entity", "public_post"):
             username = parsed["username"]
-            if username.lower().endswith("bot"):
-                return {"joined": False, "is_request": False}
             entity = await tg.get_entity(username)
+
+            # اگر در لیست جوین اجباری، یک رباتِ اسپانسر قرار داده شده باشد:
             if getattr(entity, "bot", False):
-                return {"joined": False, "is_request": False}
+                payload = parsed.get("payload")
+                cmd = f"/start {payload}" if payload else "/start"
+                await tg.send_message(entity, cmd)
+                log(f"🤖 Started sponsor bot: @{username}")
+                return {"joined": True, "is_request": False}
 
             await tg(JoinChannelRequest(entity))
             joined_entities[entity.id] = entity
@@ -998,13 +1195,32 @@ async def join_single_sponsor(url: str, joined_entities: dict) -> dict:
         return {"joined": True, "is_request": True}
 
     except FloodWaitError as e:
-        log(f"⏳ FloodWait on Join: {e.seconds}s")
-        await asyncio.sleep(e.seconds + 0.5)
+        log(f"⏳ FloodWait on Join ({url}): {e.seconds}s")
+        if e.seconds <= 8:
+            await asyncio.sleep(e.seconds + 0.5)
+        return {"joined": True, "is_request": False}
 
     except Exception as e:
-        log(f"⚠️ Could not join {url}: {repr(e)}")
+        log(f"⚠️ Could not join sponsor {url}: {repr(e)}")
+        # حتی اگر لینک اسپانسر خراب یا منقضی بود، True برمی‌گردانیم تا ربات دکمه «عضو شدم» را حتماً بزند!
+        return {"joined": True, "is_request": False}
 
-    return {"joined": False, "is_request": False}
+    return {"joined": True, "is_request": False}
+
+
+async def join_single_sponsor(url: str, joined_entities: dict) -> dict:
+    """محافظت از تابع عضویت با تایم‌اوت ۷ ثانیه‌ای برای جلوگیری از هرگونه قفل شدن"""
+    try:
+        return await asyncio.wait_for(
+            _do_join_single_sponsor(url, joined_entities),
+            timeout=7.0,
+        )
+    except asyncio.TimeoutError:
+        log(f"⏱ Timeout while joining sponsor: {url} (skipping & continuing)")
+        return {"joined": True, "is_request": False}
+    except Exception as e:
+        log(f"⚠️ Unexpected join error: {repr(e)}")
+        return {"joined": True, "is_request": False}
 
 
 async def cleanup_joined_channels(
@@ -1020,7 +1236,7 @@ async def cleanup_joined_channels(
 
     if pre_snapshot_ids is not None:
         try:
-            async for dialog in tg.iter_dialogs(limit=120):
+            async for dialog in tg.iter_dialogs(limit=100):
                 ent = dialog.entity
                 if getattr(ent, "broadcast", False) or getattr(ent, "megagroup", False) or ent.__class__.__name__ == "Chat":
                     if ent.id not in pre_snapshot_ids and ent.id != dest_raw_id:
@@ -1046,12 +1262,12 @@ async def cleanup_joined_channels(
     left_count = 0
     for item in targets:
         try:
-            await tg.delete_dialog(item)
+            await asyncio.wait_for(tg.delete_dialog(item), timeout=5.0)
             left_count += 1
             log(f"🚪 Deleted & left sponsor dialog: {getattr(item, 'title', item)}")
         except Exception:
             try:
-                await tg(LeaveChannelRequest(item))
+                await asyncio.wait_for(tg(LeaveChannelRequest(item)), timeout=5.0)
                 left_count += 1
             except Exception as e2:
                 log(f"⚠️ Cleanup skip for {item}: {repr(e2)}")
@@ -1064,11 +1280,12 @@ async def cleanup_joined_channels(
 
 
 # =========================================================
-# SMART BOT INTERACTION & MULTI-HOP REDIRECT DETECTOR
+# SMART BOT INTERACTION & ANTI-STUCK ENGINE
 # =========================================================
 
 async def inspect_and_interact_with_bot_message(
     msg,
+    bot_entity,
     current_bot_username: str,
     current_payload: str,
     joined_entities: dict,
@@ -1076,6 +1293,8 @@ async def inspect_and_interact_with_bot_message(
     step_cb=None,
 ):
     text = msg.message or ""
+    norm_text_low = normalize_persian(text).lower()
+    is_force_join_msg = any(h in norm_text_low for h in FORCE_JOIN_HINTS)
 
     wait_sec = detect_wait_timer(text)
     if wait_sec > 0:
@@ -1086,6 +1305,16 @@ async def inspect_and_interact_with_bot_message(
     next_bot_links = []
     sponsor_urls_to_join = []
     re_start_url = None
+    re_start_payload = current_payload
+
+    # بررسی وجود دکمه شیشه‌ای کلیکی (Callback) در پیام
+    has_callback_button = False
+    if getattr(msg, "buttons", None):
+        for row in msg.buttons:
+            for btn in row:
+                if not getattr(btn, "url", None):
+                    has_callback_button = True
+                    break
 
     button_urls = []
     if getattr(msg, "buttons", None):
@@ -1109,55 +1338,65 @@ async def inspect_and_interact_with_bot_message(
         if all(u != existing_url for _, existing_url in button_urls):
             button_urls.append(("لینک متنی", u))
 
+    # دسته‌بندی دقیق لینک‌های داخل پیام ربات
     for btn_label, b_url in button_urls:
         parsed = parse_tg_link(b_url)
-        if not parsed:
+        if not parsed or parsed["type"] == "folder":
             continue
 
+        norm_label = normalize_persian(btn_label).lower()
+
+        # الف) لینک دعوت خصوصی یا درخواستی -> اسپانسر
         if parsed["type"] == "invite":
             if b_url not in sponsor_urls_to_join:
                 sponsor_urls_to_join.append(b_url)
             continue
 
+        # ب) لینک به خودِ همین ربات (معمولاً دکمه «✅ عضو شدم» یا «دریافت فایل» است!)
         if (
             parsed["type"] == "bot_or_entity"
             and parsed["username"].lower() == current_bot_username.lower()
         ):
             re_start_url = b_url
+            if parsed.get("payload"):
+                re_start_payload = parsed["payload"]
             if parsed.get("payload") and parsed["payload"] != current_payload:
                 if b_url not in next_bot_links:
                     next_bot_links.append(b_url)
             continue
 
-        if parsed["type"] == "bot_or_entity" and parsed.get("payload"):
+        # ج) لینک به یک ربات دیگر
+        if parsed["type"] == "bot_or_entity" and parsed["username"].lower().endswith("bot"):
+            # اگر پیام، پیامِ جوین اجباری است و دکمه تایید دارد، این ربات یک «ربات اسپانسر» است!
+            if (is_force_join_msg or has_callback_button or re_start_url) and any(
+                w in norm_label for w in ("اسپانسر", "کانال", "جوین", "عضو", "ربات", "اول", "دوم", "سوم", "چهارم", "sponsor", "join", "bot")
+            ):
+                if b_url not in sponsor_urls_to_join:
+                    sponsor_urls_to_join.append(b_url)
             if b_url not in next_bot_links:
                 next_bot_links.append(b_url)
             continue
 
+        # د) لینک عمومی کانال یا گروه
         if parsed["type"] in ("bot_or_entity", "public_post"):
-            uname = parsed["username"]
-            if uname.lower().endswith("bot"):
-                if any(k in btn_label.lower() for k in VERIFY_KEYWORDS) and b_url not in next_bot_links:
-                    next_bot_links.append(b_url)
-            else:
-                if b_url not in sponsor_urls_to_join:
-                    sponsor_urls_to_join.append(b_url)
+            if b_url not in sponsor_urls_to_join:
+                sponsor_urls_to_join.append(b_url)
 
+    # ۱. عضویت گام‌به‌گام و ایمن در کانال‌ها/گروه‌های اسپانسر (با تایم‌اوت مجزا و گزارش زنده)
     joined_any = False
     had_join_request = False
-    if sponsor_urls_to_join:
-        if step_cb:
-            await step_cb(f"🔗 عضویت همزمان در {len(sponsor_urls_to_join)} کانال/گروه اسپانسر...")
-        results = await asyncio.gather(
-            *(join_single_sponsor(u, joined_entities) for u in sponsor_urls_to_join),
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, dict):
-                if r.get("joined"):
-                    joined_any = True
-                if r.get("is_request"):
-                    had_join_request = True
+    total_sp = len(sponsor_urls_to_join)
+
+    if total_sp > 0:
+        for idx, sp_url in enumerate(sponsor_urls_to_join, start=1):
+            if step_cb:
+                await step_cb(f"🔗 عضویت در اسپانسر {idx} از {total_sp}...")
+            res = await join_single_sponsor(sp_url, joined_entities)
+            if res.get("joined"):
+                joined_any = True
+            if res.get("is_request"):
+                had_join_request = True
+            await asyncio.sleep(0.25)
 
         if had_join_request:
             if step_cb:
@@ -1165,6 +1404,9 @@ async def inspect_and_interact_with_bot_message(
             await asyncio.sleep(1.2)
         else:
             await asyncio.sleep(0.4)
+
+    # ۲. کلیک روی دکمه تایید عضویت / ادامه (شیشه‌ای، URL به خود ربات، یا ارسال مجدد /start)
+    clicked_any_confirm = False
 
     if getattr(msg, "buttons", None):
         target_callback = None
@@ -1181,23 +1423,25 @@ async def inspect_and_interact_with_bot_message(
                 if btn_key in clicked_buttons:
                     continue
 
-                btn_low = btn_title.lower()
-                if any(kw in btn_low for kw in VERIFY_KEYWORDS):
+                btn_low = normalize_persian(btn_title).lower()
+                if any(normalize_persian(kw).lower() in btn_low for kw in VERIFY_KEYWORDS):
                     target_callback = (r_idx, b_idx, btn_title, btn_key)
                     break
                 fallback_callback = (r_idx, b_idx, btn_title, btn_key)
             if target_callback:
                 break
 
-        chosen = target_callback or (fallback_callback if joined_any else None)
+        # اگر دکمه کلیکی در پیام وجود دارد، حتماً روی آن کلیک کن!
+        chosen = target_callback or fallback_callback
         if chosen:
             r_idx, b_idx, b_title, btn_key = chosen
             clicked_buttons.add(btn_key)
+            clicked_any_confirm = True
             try:
                 if step_cb:
-                    await step_cb(f"🔘 زدن دکمه «{b_title}»...")
+                    await step_cb(f"🔘 کلیک خودکار روی دکمه «{b_title}»...")
                 log(f"🔘 Clicking button [{b_title}] on msg {msg.id}...")
-                click_res = await msg.click(r_idx, b_idx)
+                click_res = await asyncio.wait_for(msg.click(r_idx, b_idx), timeout=6.0)
 
                 res_url = getattr(click_res, "url", None)
                 if res_url:
@@ -1206,16 +1450,27 @@ async def inspect_and_interact_with_bot_message(
                         log(f"🔀 Callback redirect URL: {norm_res_url}")
                         next_bot_links.insert(0, norm_res_url)
 
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.7)
+            except asyncio.TimeoutError:
+                log(f"⏱ Timeout on msg.click([{b_title}]), continuing...")
             except Exception as e:
                 log(f"⚠️ Button click error: {repr(e)}")
 
-        elif joined_any and re_start_url:
-            btn_key = (msg.id, "restart_url", re_start_url)
-            if btn_key not in clicked_buttons:
-                clicked_buttons.add(btn_key)
-                if re_start_url not in next_bot_links:
-                    next_bot_links.insert(0, re_start_url)
+    # ۳. اگر دکمه «✅ عضو شدم / دریافت فایل» از نوع لینک به خودِ ربات بود (مثل FAGAMEUploader_bot!)
+    # یا اگر در کانال‌های اسپانسر عضو شدیم اما دکمه کلیکی وجود نداشت:
+    if (re_start_url and (joined_any or not clicked_any_confirm)) or (joined_any and not clicked_any_confirm):
+        restart_key = (msg.id, "auto_restart_cmd", re_start_payload)
+        if restart_key not in clicked_buttons:
+            clicked_buttons.add(restart_key)
+            cmd = f"/start {re_start_payload}" if re_start_payload else "/start"
+            if step_cb:
+                await step_cb(f"🔄 تایید عضویت و ارسال مجدد دستور دریافت به @{current_bot_username}...")
+            try:
+                log(f"🔄 Re-sending {cmd} to @{current_bot_username} after joining sponsors!")
+                await asyncio.wait_for(tg.send_message(bot_entity, cmd), timeout=6.0)
+                await asyncio.sleep(0.8)
+            except Exception as e:
+                log(f"⚠️ Re-start send error: {repr(e)}")
 
     return next_bot_links
 
@@ -1234,9 +1489,9 @@ async def process_channel_post(parsed_info, step_cb=None):
             if parsed_info["type"] == "private_post"
             else parsed_info["username"]
         )
-        entity = await tg.get_entity(target)
+        entity = await asyncio.wait_for(tg.get_entity(target), timeout=8.0)
         msg_id = parsed_info["msg_id"]
-        msg = await tg.get_messages(entity, ids=msg_id)
+        msg = await asyncio.wait_for(tg.get_messages(entity, ids=msg_id), timeout=8.0)
 
         if not msg:
             return {"success": False, "count": 0, "skipped": 0, "reason": "پست یافت نشد."}
@@ -1323,7 +1578,7 @@ async def process_one_link(
     try:
         if step_cb:
             await step_cb(f"📡 اتصال سریع به @{username} (مرحله {hop_depth + 1})...")
-        bot = await tg.get_entity(username)
+        bot = await asyncio.wait_for(tg.get_entity(username), timeout=8.0)
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
 
@@ -1339,7 +1594,7 @@ async def process_one_link(
         command = f"/start {payload}" if payload else "/start"
         if step_cb:
             await step_cb(f"📨 ارسال دستور شروع به @{username}...")
-        request = await tg.send_message(bot, command)
+        request = await asyncio.wait_for(tg.send_message(bot, command), timeout=8.0)
         log(f"📨 [Hop {hop_depth + 1}] Sent to @{username}: {command}")
     except Exception as e:
         return {"success": False, "count": 0, "skipped": 0, "reason": str(e)}
@@ -1354,15 +1609,20 @@ async def process_one_link(
     media_count = 0
     skipped_dups = 0
     last_activity_time = start_time
+    fallback_restarted = False
 
     try:
         while not stop_requested:
             now = asyncio.get_running_loop().time()
-            if now - start_time >= WAIT_SECONDS:
+            elapsed = int(now - start_time)
+            if elapsed >= WAIT_SECONDS:
                 break
 
             try:
-                messages = await tg.get_messages(bot, limit=25, min_id=min_id)
+                messages = await asyncio.wait_for(
+                    tg.get_messages(bot, limit=25, min_id=min_id),
+                    timeout=6.0,
+                )
             except Exception as e:
                 log(f"⚠️ Read error: {repr(e)}")
                 await asyncio.sleep(0.4)
@@ -1373,6 +1633,7 @@ async def process_one_link(
                 if m and m.id > request.id and not m.out
             ]
 
+            # اولویت ۱: شکار و ارسال آنی رسانه‌ها
             media_batches = []
             current_group_id = None
             current_group_list = []
@@ -1404,9 +1665,7 @@ async def process_one_link(
 
             for batch in media_batches:
                 if step_cb:
-                    await step_cb(
-                        f"⚡ رسانه دریافت شد! ارسال فوری به مقصد..."
-                    )
+                    await step_cb("⚡ رسانه دریافت شد! ارسال فوری به مقصد...")
                 res = await send_media_group_or_single(batch)
                 if res["success"]:
                     media_count += res["count"]
@@ -1416,6 +1675,7 @@ async def process_one_link(
                     skipped_dups += res.get("skipped", 0)
                     log(f"❌ Media batch error: {res['error']}")
 
+            # اولویت ۲: بررسی پیام‌های جوین اجباری و دکمه‌های مرحله‌ای
             for message in messages:
                 btn_count = sum(len(r) for r in (getattr(message, "buttons", None) or []))
                 sig = (
@@ -1431,17 +1691,37 @@ async def process_one_link(
                     inspected_text_signatures.add(sig)
                     hops = await inspect_and_interact_with_bot_message(
                         message,
+                        bot,
                         username,
                         payload,
                         joined_entities,
                         clicked_buttons,
                         step_cb=step_cb,
                     )
+                    last_activity_time = asyncio.get_running_loop().time()
                     for h in hops:
                         if h not in discovered_bot_hops and normalize_tg_url(h) not in visited_links:
                             discovered_bot_hops.append(h)
-                            last_activity_time = asyncio.get_running_loop().time()
 
+            # اولویت ۳: اگر در اسپانسرها عضو شدیم و دکمه کلیکی را زدیم ولی بعد از ۴ ثانیه هنوز فایلی نیامده،
+            # یک بار دستور /start <payload> را مجدداً ارسال کن (مخصوص ربات‌هایی که بعد از کلیک نیاز به استارت مجدد دارند)
+            if (
+                media_count == 0
+                and not fallback_restarted
+                and (joined_entities or clicked_buttons)
+                and (asyncio.get_running_loop().time() - last_activity_time) >= 3.8
+            ):
+                fallback_restarted = True
+                cmd = f"/start {payload}" if payload else "/start"
+                if step_cb:
+                    await step_cb(f"🔄 ارسال مجدد دستور دریافت فایل به @{username}...")
+                try:
+                    await asyncio.wait_for(tg.send_message(bot, cmd), timeout=5.0)
+                    last_activity_time = asyncio.get_running_loop().time()
+                except Exception:
+                    pass
+
+            # اولویت ۴: پرش هوشمند به ربات دوم/سوم
             if media_count == 0 and discovered_bot_hops:
                 next_link = discovered_bot_hops.pop(0)
                 parsed_next = parse_tg_link(next_link)
@@ -1470,6 +1750,9 @@ async def process_one_link(
                 >= AFTER_MEDIA_WAIT
             ):
                 break
+
+            if media_count == 0 and step_cb and elapsed > 2:
+                await step_cb(f"⏳ منتظر دریافت فایل از @{username} ({elapsed}s)...")
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -1529,6 +1812,7 @@ async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     )
 
     last_edit_time = 0.0
+    last_step_str = ""
 
     try:
         while link_queue and not stop_requested:
@@ -1539,12 +1823,13 @@ async def run_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
             async def update_live_step(step_text: str, force: bool = False):
                 global current_live_step
-                nonlocal last_edit_time
+                nonlocal last_edit_time, last_step_str
                 current_live_step = step_text
                 now = time.monotonic()
-                if not force and (now - last_edit_time) < 0.7:
+                if not force and (step_text == last_step_str or (now - last_edit_time) < 0.75):
                     return
                 last_edit_time = now
+                last_step_str = step_text
                 try:
                     await status_message.edit_text(
                         "⚡ <b>در حال استخراج و ارسال هوشمند...</b>\n\n"
@@ -1618,6 +1903,72 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     # -----------------------------------------------------
+    # پنل مدیریت سرور (AWS Ubuntu)
+    # -----------------------------------------------------
+    if data == "server_menu":
+        stats_text = await get_server_stats_text()
+        await query.edit_message_text(
+            stats_text,
+            parse_mode="HTML",
+            reply_markup=server_control_menu(),
+        )
+        return
+
+    if data == "server_logs":
+        logs_str = await asyncio.to_thread(get_recent_service_logs, 25)
+        await query.edit_message_text(
+            f"📜 <b>آخرین لاگ‌های زنده سرور (tgbot.service):</b>\n\n<pre>{logs_str}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔄 رفرش لاگ", callback_data="server_logs"),
+                    InlineKeyboardButton("🔙 پنل سرور", callback_data="server_menu"),
+                ]
+            ]),
+        )
+        return
+
+    if data == "server_clean":
+        res_msg = await asyncio.to_thread(clean_server_temp_files)
+        stats_text = await get_server_stats_text()
+        await query.edit_message_text(
+            f"✅ <b>{res_msg}</b>\n\n{stats_text}",
+            parse_mode="HTML",
+            reply_markup=server_control_menu(),
+        )
+        return
+
+    if data == "server_restart_bot":
+        await query.edit_message_text(
+            "♻️ <b>در حال ری‌استارت سرویس ربات...</b>\nچند ثانیه دیگر /start بزنید.",
+            parse_mode="HTML",
+        )
+        asyncio.create_task(restart_bot_process())
+        return
+
+    if data == "server_reboot_confirm":
+        await query.edit_message_text(
+            "⚠️ <b>آیا از ریبوت کامل سرور اوبونتو (AWS) مطمئن هستید؟</b>\n\n"
+            "با ریبوت شدن سرور، ارتباط حدود ۳۰ ثانیه قطع می‌شود و پس از بالا آمدن سرور، ربات به صورت خودکار روشن خواهد شد.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ بله، سرور ریبوت شود", callback_data="server_reboot_do"),
+                    InlineKeyboardButton("❌ انصراف", callback_data="server_menu"),
+                ]
+            ]),
+        )
+        return
+
+    if data == "server_reboot_do":
+        await query.edit_message_text(
+            "🔥 <b>دستور ریبوت سرور صادر شد!</b>\nسرور تا ۳۰ ثانیه دیگر مجدداً بالا می‌آید و ربات خودکار فعال می‌شود.",
+            parse_mode="HTML",
+        )
+        subprocess.Popen(["sudo", "reboot"])
+        return
+
+    # -----------------------------------------------------
     # دکمه آپدیت خودکار از مخزن گیت‌هاب
     # -----------------------------------------------------
     if data == "self_update":
@@ -1635,7 +1986,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f.write(new_code)
 
             await query.edit_message_text(
-                "✅ <b>آپدیت با موفقیت از گیت‌هاب دریافت و ذخیره شد!</b>\n"
+                "✅ <b>آپدیت با موفقیت از گیت‌هاب دریافت و نصب شد!</b>\n"
                 "♻️ ربات در حال ری‌استارت خودکار است (چند ثانیه دیگر /start بزنید)...",
                 parse_mode="HTML",
             )
@@ -1832,7 +2183,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
 
-    # قابلیت آپدیت مستقیم با ارسال فایل main.py در چت ربات
     if msg.document and msg.document.file_name == "main.py":
         status_msg = await msg.reply_text("🔄 <b>فایل <code>main.py</code> دریافت شد! در حال نصب آپدیت...</b>", parse_mode="HTML")
         try:
